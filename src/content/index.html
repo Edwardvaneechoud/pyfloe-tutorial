@@ -1,0 +1,99 @@
+<div class="landing-hero">
+  <h1>Build Your Own <em>DataFrame</em></h1>
+  <p class="tagline">
+    A hands-on course that takes apart a real dataframe engine — pyfloe —
+    and teaches you the architecture behind Polars, Spark, and every
+    serious query engine.
+  </p>
+  <p class="landing-sub">
+    This isn't a course you read &mdash; it's a course you build with.
+    Every code example is editable and runnable. Change things. Break
+    things. That's the point.
+  </p>
+  <a href="/introduction/" class="landing-start">Start the course</a>
+</div>
+
+<div class="landing-toc">
+  <h2>Course outline</h2>
+  <ul class="toc-list">
+    <li class="toc-item">
+      <div class="toc-num">0</div>
+      <a href="/introduction/" class="toc-link">
+        <div class="toc-title">Introduction: Meet pyfloe</div>
+        <div class="toc-desc">A zero-dependency, lazy dataframe engine in pure Python — and the teaching vehicle for this entire course.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num">1</div>
+      <a href="/module-1/" class="toc-link">
+        <div class="toc-title">The Context & Foundation</div>
+        <div class="toc-desc">Why DataFrames exist. Eager vs. lazy execution. Generators and the volcano model. Why lambdas are a dead end for optimization.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num">2</div>
+      <a href="/module-2/" class="toc-link">
+        <div class="toc-title">Python Magic — Dunder Methods & the Expression AST</div>
+        <div class="toc-desc">Hijacking Python's operators so <code>pf.col("x") + pf.col("y")</code> builds an inspectable tree instead of running a computation.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num">3</div>
+      <a href="/module-3/" class="toc-link">
+        <div class="toc-title">The Engine Room — Plan Nodes & Batched Execution</div>
+        <div class="toc-desc">Plugging expressions into plan nodes. Batched execution for performance. The LazyFrame wrapper. Schema propagation without data.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num">4</div>
+      <a href="/module-4/" class="toc-link">
+        <div class="toc-title">Advanced Algorithms — Hashing, Grouping & Joins</div>
+        <div class="toc-desc">Hash joins, join variants, hash aggregation with running accumulators, and sorted-stream alternatives with constant memory.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num">5</div>
+      <a href="/module-5/" class="toc-link">
+        <div class="toc-title">The Query Optimizer (Capstone)</div>
+        <div class="toc-desc">Filter pushdown and column pruning — the optimizer walks the plan tree, inspects expression trees, and rewrites the plan.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num toc-extra">+</div>
+      <a href="/interlude-wiring/" class="toc-link">
+        <div class="toc-title">Interlude: Wiring It Together</div>
+        <div class="toc-desc">Wire everything into a complete mini-pipeline and watch it run end to end.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num toc-extra">+</div>
+      <a href="/interlude-why/" class="toc-link">
+        <div class="toc-title">Interlude: Why I Think This Is Interesting</div>
+        <div class="toc-desc">A personal reflection on why understanding the internals matters.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num toc-extra">+</div>
+      <a href="/deep-dive-streaming/" class="toc-link">
+        <div class="toc-title">Deep Dive: Streaming I/O</div>
+        <div class="toc-desc">Factory-based generators, constant-memory file reading, and type inference from streaming data.</div>
+      </a>
+    </li>
+    <li class="toc-item">
+      <div class="toc-num toc-extra">+</div>
+      <a href="/epilogue/" class="toc-link">
+        <div class="toc-title">Epilogue: Where Do You Go From Here?</div>
+        <div class="toc-desc">Next steps, further reading, and ideas for building your own engine.</div>
+      </a>
+    </li>
+  </ul>
+</div>
+
+<div class="landing-about">
+  <p>
+    This course is built around <a href="https://github.com/Edwardvaneechoud/pyfloe">pyfloe</a> — a lazy dataframe
+    library written entirely in pure Python. No C extensions, no Rust bindings,
+    no dependencies. The same architectural patterns as the big libraries,
+    in a codebase small enough to read in an afternoon.
+  </p>
+</div>

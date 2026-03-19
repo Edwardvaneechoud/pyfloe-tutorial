@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/module-2.html?raw';
+---
+
+<CourseLayout title="Python Magic — Dunder Methods & the Expression AST" activeSlug="module-2" moduleBadge="Module 2 of 5">
+  <Fragment set:html={html} />
+</CourseLayout>

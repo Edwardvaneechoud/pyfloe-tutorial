@@ -1,0 +1,1432 @@
+<h1>Hijacking Python's<br>Operators with <em>Dunder Methods</em></h1>
+
+<p class="subtitle">
+In Module 1, we built a lazy DataFrame engine with generators and the
+Volcano Model. But we ended on a cliffhanger: our <code>FilterNode</code>
+relied on a Python <code>lambda</code> — a black box our engine could
+never look inside. Time to fix that.
+</p>
+
+<p>
+If we want to build a real query engine — one with an optimizer that can
+prune unused columns and reorder operations — we need to <em>see inside</em>
+the filter. We need <code>col("age") > 28</code> to return not
+<code>True</code> or <code>False</code>, but a <strong>readable data
+structure</strong> our engine can inspect, rearrange, and eventually
+evaluate.
+</p>
+
+<p>
+This is the exact "magic" that makes Polars and PySpark so expressive.
+And to build it, we're going to use one of Python's most powerful
+features: <strong>Dunder Methods</strong>.
+</p>
+
+<nav class="toc">
+  <div class="toc-title">In this module</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">2.1</span> Dunder Methods — Python's Secret Protocol</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">2.2</span> Hijacking the Operators — Building an AST</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">2.3</span> Giving the AST a Voice — The eval() Method</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">2.4</span> The Payoff — Inspectable Expressions</a>
+</nav>
+
+<!-- ============================================================ -->
+<!-- LESSON 2.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Lesson 2.1</span>
+  Dunder Methods — Python's Secret Protocol
+</h2>
+
+<p>
+Let's remind ourselves of the problem we need to solve. Here's the
+filter from Module 1:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> The problem we left off with</div>
+<pre><code><span class="va">df</span>.filter(<span class="kw">lambda</span> <span class="va">row</span>: <span class="va">row</span>[<span class="st">"age"</span>] <span class="op">&gt;</span> <span class="nu">28</span>)</code></pre>
+
+<p>
+This lambda works perfectly for execution. But an optimizer needs to
+answer questions like: <em>"Which columns does this filter use?"</em>
+and <em>"Can I push this filter down before the join?"</em> With a
+lambda, the answer to both is: <strong>I have no idea</strong>. To the engine,
+a lambda is just an opaque, unreadable blob of Python bytecode.
+</p>
+
+<p>
+We want to replace it with something like this:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> The goal — a readable, inspectable expression</div>
+<pre><code><span class="va">df</span>.filter(col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">28</span>)</code></pre>
+
+<p>
+Same intent, same readability — but instead of evaluating instantly,
+<code>col("age") > 28</code> should return a <strong>blueprint</strong>:
+a tree-like data structure that <em>records</em> the operation without
+executing it. In computer science, this kind of blueprint is called an
+<strong>Abstract Syntax Tree</strong> — or AST. Let's unpack that.
+</p>
+
+<h3>What is an Abstract Syntax Tree?</h3>
+
+<p>
+You already know what a tree is from everyday life: a thing with a root,
+branches, and leaves. An AST is the same idea, applied to an expression.
+Take a simple math expression: <code>(2 + 3) * 10</code>. You can draw
+it as a tree where the operator sits at each branch and the values sit at
+the leaves:
+</p>
+
+<div style="margin: 28px 0; text-align: center;">
+<svg width="100%" viewBox="0 0 320 260" style="max-width: 320px;" xmlns="http://www.w3.org/2000/svg">
+  <!-- Root: * -->
+  <rect class="ast-box ast-op" x="110" y="10" width="100" height="44"/>
+  <text class="ast-lbl" x="160" y="38" text-anchor="middle" fill="#534AB7">*</text>
+  <text class="ast-tag" x="160" y="24" text-anchor="middle" fill="#9C9A92">operator</text>
+
+  <!-- Left child: + -->
+  <rect class="ast-box ast-op" x="24" y="100" width="100" height="44"/>
+  <text class="ast-lbl" x="74" y="128" text-anchor="middle" fill="#534AB7">+</text>
+  <text class="ast-tag" x="74" y="114" text-anchor="middle" fill="#9C9A92">operator</text>
+
+  <!-- Right child: 10 -->
+  <rect class="ast-box ast-val" x="196" y="100" width="100" height="44"/>
+  <text class="ast-lbl" x="246" y="130" text-anchor="middle" fill="#3D5A80">10</text>
+
+  <!-- Leaf: 2 -->
+  <rect class="ast-box ast-val" x="0" y="196" width="62" height="44"/>
+  <text class="ast-lbl" x="31" y="226" text-anchor="middle" fill="#3D5A80">2</text>
+
+  <!-- Leaf: 3 -->
+  <rect class="ast-box ast-val" x="86" y="196" width="62" height="44"/>
+  <text class="ast-lbl" x="117" y="226" text-anchor="middle" fill="#3D5A80">3</text>
+
+  <!-- Edges -->
+  <line class="ast-edge" x1="140" y1="54" x2="90" y2="100"/>
+  <line class="ast-edge" x1="180" y1="54" x2="230" y2="100"/>
+  <line class="ast-edge" x1="54" y1="144" x2="31" y2="196"/>
+  <line class="ast-edge" x1="94" y1="144" x2="117" y2="196"/>
+</svg>
+</div>
+
+<p>
+To evaluate this tree, you start at the bottom: grab the <code>2</code>
+and the <code>3</code>, hand them to the <code>+</code> operator
+(result: <code>5</code>), then hand that <code>5</code> and
+<code>10</code> to the <code>*</code> operator (result: <code>50</code>).
+The tree <em>describes</em> the computation without doing it — and you
+can walk it from the bottom up whenever you're ready.
+</p>
+
+<p>
+Let's break down the name:
+</p>
+
+<p>
+<strong>Tree</strong> — it's a hierarchy of nodes. Operators are branch
+nodes (they have children). Values are leaf nodes (they don't).
+</p>
+
+<p>
+<strong>Syntax</strong> — it represents the <em>structure</em> of an
+expression. The tree captures what <code>(2 + 3) * 10</code> means
+structurally: "multiply the result of adding 2 and 3 by 10."
+</p>
+
+<p>
+<strong>Abstract</strong> — it throws away surface details. It doesn't
+care about parentheses, whitespace, or the fact that you typed
+<code>*</code> instead of calling <code>operator.mul</code>. It keeps
+only the essential meaning.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Two trees in this course — don't confuse them</div>
+  In Module 1, we built a chain of <strong>plan nodes</strong>
+  (ScanNode → FilterNode → collect). That's a tree too — it
+  describes <em>how data flows</em> through the engine. The
+  <strong>expression AST</strong> we're building now is a different tree:
+  it describes <em>what to compute</em> on each row. Expressions live
+  <em>inside</em> plan nodes — a <code>FilterNode</code> holds an
+  expression that it evaluates per row. Two trees, different jobs.
+</div>
+
+<p>
+Our goal for the rest of this module: make it so that writing
+<code>col("price") * col("quantity") > 1000</code> doesn't evaluate to
+a result — it builds one of these trees.
+</p>
+
+<p>
+Normally, Python sees <code>></code> and immediately computes a value.
+We need to <em>hijack</em> that instinct:
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-eager">Normal Python</span> Evaluates instantly</h4>
+    <p>
+      <code>5 * 4 > 1000</code><br><br>
+      Python computes <code>20</code>, compares to <code>1000</code>,
+      and returns <code>False</code>. The expression is gone — only the
+      boolean remains.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-lazy">Our Expr system</span> Builds a tree</h4>
+    <p>
+      <code>lit(5) * lit(4) > lit(1000)</code><br><br>
+      Same math, same numbers — but returns a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a>
+      tree with three <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> nodes at the leaves. Nothing is
+      computed. The engine can inspect it and evaluate it later.
+    </p>
+  </div>
+</div>
+
+<p>
+And of course in real code, the leaves are column references instead of
+hard-coded numbers — <code>col("price") * col("qty") > 1000</code>.
+But the mechanism is identical: the operators build a tree instead of
+computing a value.
+</p>
+
+<p>
+But how do we make Python's <code>*</code> and <code>&gt;</code>
+operators build tree nodes instead of computing values? The answer lies
+in a set of hidden methods that Python calls behind the scenes.
+</p>
+
+<h3>Operators are just method calls</h3>
+
+<p>
+Every time you write <code>a + b</code> in Python, you are <em>not</em>
+calling some hard-coded addition built into the language. You are calling
+a method on the object <code>a</code>. Specifically, Python translates
+<code>a + b</code> into <code>a.__add__(b)</code>.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Python translates operators into method calls</div>
+<pre><code><span class="cm"># What you write:        What Python actually calls:</span>
+<span class="va">a</span> <span class="op">+</span> <span class="va">b</span>                   <span class="cm"># a.__add__(b)</span>
+<span class="va">a</span> <span class="op">&gt;</span> <span class="va">b</span>                   <span class="cm"># a.__gt__(b)</span>
+<span class="va">a</span> <span class="op">==</span> <span class="va">b</span>                  <span class="cm"># a.__eq__(b)</span>
+<span class="va">a</span> <span class="op">*</span> <span class="va">b</span>                   <span class="cm"># a.__mul__(b)</span>
+<span class="op">-</span><span class="va">a</span>                      <span class="cm"># a.__neg__()</span>
+<span class="op">~</span><span class="va">a</span>                      <span class="cm"># a.__invert__()</span></code></pre>
+
+<p>
+These methods — whose names start and end with double underscores — are
+called <strong>dunder methods</strong> (short for "double underscore").
+They are Python's protocol for <strong>operator overloading</strong>:
+the ability to define what <code>+</code>, <code>&gt;</code>,
+<code>==</code>, and dozens of other operators <em>do</em> for your
+custom objects.
+</p>
+
+<p>
+For integers and floats, these dunders perform arithmetic. But here's the
+key insight: <span class="highlight">you can define these methods on your
+own classes to make them do <em>anything</em></span>.
+</p>
+
+<p>
+And that's the trick we need: an operator that
+<strong>builds a new object</strong> instead of computing a result.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The core idea</div>
+  What if we override <code>__gt__</code> on our expression class so
+  that <code>col("age") > 28</code> doesn't compare anything — it
+  returns a new AST node that <em>describes</em> the comparison? Not
+  <code>True</code> or <code>False</code> — a data structure that says
+  "compare the left thing to the right thing using greater-than." That
+  data structure is something our optimizer can read.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 2.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Lesson 2.2</span>
+  Hijacking the Operators — Building an AST
+</h2>
+
+<p>
+Let's build this step by step. We'll follow the same pattern you'll see
+throughout this course: start with a <strong>simplified version</strong>
+to understand the shape, then reveal <strong>pyfloe's real code</strong>
+to see what a production implementation adds.
+</p>
+
+<div class="aside">
+  <div class="aside-title">Reading the code labels</div>
+  Throughout this course, the colored dots on code snippets tell you
+  what you're looking at:
+  <span class="dot dot-naive" style="display:inline-block;vertical-align:middle;margin:0 2px;"></span>
+  <strong>coral</strong> = the naive or starting approach,
+  <span class="dot dot-better" style="display:inline-block;vertical-align:middle;margin:0 2px;"></span>
+  <strong>teal</strong> = an improved version that solves the limitation,
+  <span class="dot dot-pyfloe" style="display:inline-block;vertical-align:middle;margin:0 2px;"></span>
+  <strong>purple</strong> = pyfloe's actual source code. The progression
+  is always: understand the concept first, then see how the real library
+  implements it.
+</div>
+
+<p>
+First, we need the simplest possible
+foundation: a base class <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Expr" class="source-link" target="_blank" rel="noopener"><code>Expr</code></a> (for "expression") and a
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> class that represents a column reference.
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Our starting point — bare minimum</div>
+<pre><code><span class="kw">class</span> <span class="cl">Expr</span>:
+    <span class="dc">"""Base class for all expressions."""</span>
+    <span class="kw">pass</span>
+
+<span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="dc">"""A column reference expression."""</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">name</span>: <span class="bi">str</span>):
+        <span class="va">self</span>.name <span class="op">=</span> <span class="va">name</span>
+
+<span class="kw">def</span> <span class="fn">col</span>(<span class="va">name</span>: <span class="bi">str</span>) <span class="op">-&gt;</span> <span class="cl">Col</span>:
+    <span class="kw">return</span> Col(<span class="va">name</span>)</code></pre>
+
+<p>
+Now, if a user types <code>col("age")</code>, they get a <code>Col</code>
+object back. Great. But what happens if they type
+<code>col("age") > 28</code>?
+</p>
+
+<p>
+Python looks at the <code>Col</code> object on the left, looks at the
+integer <code>28</code> on the right, and <strong>panics</strong>. It
+doesn't know how to compare a <code>Col</code> to an integer. There is
+no <code>__gt__</code> method defined, so Python throws a
+<code>TypeError</code>.
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Python panics — no __gt__ defined</div>
+<pre><code><span class="op">&gt;&gt;&gt;</span> col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">28</span>
+<span class="cm"># TypeError: '>' not supported between instances of 'Col' and 'int'</span></code></pre>
+
+<p>
+This is the moment where dunder methods save us. We need to tell Python:
+"When someone writes <code>&gt;</code> on an <code>Expr</code>, don't
+try to compare anything. Build a <strong>new object</strong> that
+<em>records</em> the comparison."
+</p>
+
+<p>
+That new object is called a <code>BinaryExpr</code> — "binary" because
+it has two children (a left side and a right side):
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — the BinaryExpr node</div>
+<pre><code><span class="kw">import</span> operator <span class="kw">as</span> _op
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="dc">"""Two operands combined with a binary operator."""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">left</span>: <span class="cl">Expr</span>, <span class="va">right</span>: <span class="cl">Expr</span>, <span class="va">op</span>, <span class="va">op_str</span>: <span class="bi">str</span>):
+        <span class="va">self</span>.left   <span class="op">=</span> <span class="va">left</span>      <span class="cm"># left child (an Expr)</span>
+        <span class="va">self</span>.right  <span class="op">=</span> <span class="va">right</span>     <span class="cm"># right child (an Expr)</span>
+        <span class="va">self</span>.op     <span class="op">=</span> <span class="va">op</span>        <span class="cm"># the callable (e.g., operator.gt)</span>
+        <span class="va">self</span>.op_str <span class="op">=</span> <span class="va">op_str</span>   <span class="cm"># for display: ">", "+", etc.</span></code></pre>
+
+<p>
+It stores four things: the left and right children (which are themselves
+<code>Expr</code> objects), the operator as a callable Python function,
+and a string representation for debugging.
+</p>
+
+<p>
+Now comes the hijack. We go back to our <code>Expr</code> base class and
+add a <code>__gt__</code> method that <strong>creates</strong> a
+<code>BinaryExpr</code> instead of doing a comparison:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — hijacking the > operator</div>
+<pre><code><span class="kw">class</span> <span class="cl">Expr</span>:
+    <span class="kw">def</span> <span class="fn">__gt__</span>(<span class="va">self</span>, <span class="va">other</span>):
+        <span class="cm"># Don't compare. Build an AST node!</span>
+        <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.gt, <span class="st">'>'</span>)</code></pre>
+
+<p>
+Now, watch the magic happen. When a user types
+<code>col("age") > 28</code>, Python calls
+<code>col("age").__gt__(28)</code>. That method doesn't compare anything.
+It creates a <code>BinaryExpr</code> with <code>Col("age")</code> as
+the left child, <code>28</code> (wrapped as a <code>Lit</code>) as the
+right child, and <code>operator.gt</code> as the operation.
+</p>
+
+<p>
+<strong>The result is a tree, not a boolean.</strong> We have
+successfully delayed execution and built an AST!
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">Show the magic</div>
+  This is the exact pattern that pyfloe uses for
+  <em>all</em> operators — <code>__add__</code>,
+  <code>__eq__</code>, <code>__and__</code>, and more. Polars, PySpark, and SQLAlchemy use
+  the same approach. Every <code>col("price") * 0.9</code> in Polars builds
+  an AST node behind the scenes via a dunder method.
+</div>
+
+<h3>The Lit class and _ensure_expr</h3>
+
+<p>
+You may have noticed the <code>_ensure_expr(other)</code> call. When a
+user writes <code>col("age") > 28</code>, the <code>28</code> is a plain
+Python integer, not an <code>Expr</code> object. But our
+<code>BinaryExpr</code> expects both children to be expressions. So we
+need a literal value class and a tiny helper to auto-wrap raw values:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — Lit and _ensure_expr</div>
+<pre><code><span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="dc">"""A literal value expression — always returns the same constant."""</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">value</span>):
+        <span class="va">self</span>.value <span class="op">=</span> <span class="va">value</span>
+
+<span class="kw">def</span> <span class="fn">_ensure_expr</span>(<span class="va">val</span>) <span class="op">-&gt;</span> <span class="cl">Expr</span>:
+    <span class="dc">"""Wrap raw Python values as Lit expressions."""</span>
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">val</span>, Expr):
+        <span class="kw">return</span> <span class="va">val</span>       <span class="cm"># already an expression — leave it alone</span>
+    <span class="kw">return</span> Lit(<span class="va">val</span>)      <span class="cm"># wrap the raw value as a literal</span></code></pre>
+
+<p>
+This is why you can write <code>col("price") * 0.9</code> without
+explicitly calling <code>lit(0.9)</code>. The dunder method calls
+<code>_ensure_expr(0.9)</code>, which wraps it automatically. A small
+convenience — but it's what makes the API feel natural.
+</p>
+
+<p>
+Polars does the same thing — <code>col("price") * 0.9</code> auto-wraps
+<code>0.9</code> as a literal via the <code>__mul__</code> dunder. pyfloe's
+<code>_ensure_expr</code> is the same trick.
+</p>
+
+<p>
+pyfloe also provides public constructor functions so the API reads
+cleanly:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — convenience constructors</div>
+<pre><code><span class="kw">def</span> <span class="fn">col</span>(<span class="va">name</span>: <span class="bi">str</span>) <span class="op">-&gt;</span> <span class="cl">Col</span>:
+    <span class="dc">"""Create a column reference expression."""</span>
+    <span class="kw">return</span> Col(<span class="va">name</span>)
+
+<span class="kw">def</span> <span class="fn">lit</span>(<span class="va">value</span>) <span class="op">-&gt;</span> <span class="cl">Lit</span>:
+    <span class="dc">"""Create a literal value expression."""</span>
+    <span class="kw">return</span> Lit(<span class="va">value</span>)</code></pre>
+
+<p>
+These are the exact same functions you'd use with Polars:
+<code>pf.col</code>, <code>pf.lit</code> (after <code>import pyfloe as pf</code>). That's not a coincidence.
+</p>
+
+<pre data-executable data-label="Explore the expression AST"><code>import pyfloe as pf
+
+# When you write this, Python calls __mul__ then __gt__.
+# No computation happens — it builds a TREE of objects.
+expr = pf.col("price") * pf.col("quantity") > 1000
+
+# The result is a BinaryExpr, not True/False!
+print("Expression:", repr(expr))
+print("Type:", type(expr).__name__)
+print()
+
+# Walk the tree: the root is ">"
+print(f"Root operator: {expr.op_str}")
+print(f"  Left child:  {repr(expr.left)}  (type: {type(expr.left).__name__})")
+print(f"  Right child: {repr(expr.right)}  (type: {type(expr.right).__name__})")
+print()
+
+# The left child is itself a tree: "*"
+mul_node = expr.left
+print(f"Drilling into the '*' node:")
+print(f"  Left:  {repr(mul_node.left)}  → column reference")
+print(f"  Right: {repr(mul_node.right)}  → column reference")
+print()
+
+# The tree knows which columns it needs — no execution required
+print("Required columns:", expr.required_columns())
+print()
+
+# Now evaluate it against an actual row
+row = ("Widget", 25.0, 4)
+col_map = {"name": 0, "price": 1, "quantity": 2}
+result = expr.eval(row, col_map)
+print(f"eval({row}) → 25.0 * 4 = 100.0, then 100.0 > 1000 → {result}")</code></pre>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Try it yourself</div>
+  Modify the code above. Build your own expression &mdash; try
+  <code>pf.col("price") + pf.col("tax") &gt; pf.col("budget")</code>.
+  How many nodes does the tree have? What does
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a> return? Can you predict the structure
+  before running it? Change the data and see if <code>eval()</code>
+  gives you what you expect.
+</div>
+
+<h3>The full operator table</h3>
+
+<p>
+With <code>__gt__</code> working, adding every other operator is
+mechanical — each one is a one-liner that builds a new
+<code>BinaryExpr</code> node. Seventeen operators, all following the same pattern:
+</p>
+
+<details class="deep-dive">
+<summary>All operator overloads — same pattern, different operators</summary>
+<div class="deep-dive-body">
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — all operator overloads</div>
+<pre><code><span class="kw">class</span> <span class="cl">Expr</span>:
+    <span class="cm"># Comparisons</span>
+    <span class="kw">def</span> <span class="fn">__gt__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.gt, <span class="st">'>'</span>)
+    <span class="kw">def</span> <span class="fn">__ge__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.ge, <span class="st">'>='</span>)
+    <span class="kw">def</span> <span class="fn">__lt__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.lt, <span class="st">'<'</span>)
+    <span class="kw">def</span> <span class="fn">__le__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.le, <span class="st">'<='</span>)
+    <span class="kw">def</span> <span class="fn">__eq__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.eq, <span class="st">'=='</span>)
+    <span class="kw">def</span> <span class="fn">__ne__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.ne, <span class="st">'!='</span>)
+
+    <span class="cm"># Arithmetic</span>
+    <span class="kw">def</span> <span class="fn">__add__</span>(<span class="va">self</span>, <span class="va">other</span>):      <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.add, <span class="st">'+'</span>)
+    <span class="kw">def</span> <span class="fn">__sub__</span>(<span class="va">self</span>, <span class="va">other</span>):      <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.sub, <span class="st">'-'</span>)
+    <span class="kw">def</span> <span class="fn">__mul__</span>(<span class="va">self</span>, <span class="va">other</span>):      <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.mul, <span class="st">'*'</span>)
+    <span class="kw">def</span> <span class="fn">__truediv__</span>(<span class="va">self</span>, <span class="va">other</span>):  <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.truediv, <span class="st">'/'</span>)
+    <span class="kw">def</span> <span class="fn">__floordiv__</span>(<span class="va">self</span>, <span class="va">other</span>): <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.floordiv, <span class="st">'//'</span>)
+    <span class="kw">def</span> <span class="fn">__mod__</span>(<span class="va">self</span>, <span class="va">other</span>):      <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), _op.mod, <span class="st">'%'</span>)
+
+    <span class="cm"># Unary</span>
+    <span class="kw">def</span> <span class="fn">__neg__</span>(<span class="va">self</span>):             <span class="kw">return</span> UnaryExpr(<span class="va">self</span>, _op.neg, <span class="st">'-'</span>)
+    <span class="kw">def</span> <span class="fn">__invert__</span>(<span class="va">self</span>):          <span class="kw">return</span> UnaryExpr(<span class="va">self</span>, _op.not_, <span class="st">'~'</span>)
+
+    <span class="cm"># Logical</span>
+    <span class="kw">def</span> <span class="fn">__and__</span>(<span class="va">self</span>, <span class="va">other</span>):     <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), <span class="kw">lambda</span> a,b: a <span class="kw">and</span> b, <span class="st">'&'</span>)
+    <span class="kw">def</span> <span class="fn">__or__</span>(<span class="va">self</span>, <span class="va">other</span>):      <span class="kw">return</span> BinaryExpr(<span class="va">self</span>, _ensure_expr(<span class="va">other</span>), <span class="kw">lambda</span> a,b: a <span class="kw">or</span> b,  <span class="st">'|'</span>)</code></pre>
+</div>
+</details>
+
+<h3>Edge case: reverse operators</h3>
+
+<p>
+There's a subtle problem. What happens when the expression is written
+"backwards" — with the plain value on the <em>left</em>?
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> This would fail without reverse operators</div>
+<pre><code><span class="nu">100</span> <span class="op">+</span> col(<span class="st">"amount"</span>)
+<span class="cm"># Python tries: (100).__add__(col("amount"))</span>
+<span class="cm"># int doesn't know how to add an Expr → returns NotImplemented</span></code></pre>
+
+<p>
+When <code>int.__add__</code> returns <code>NotImplemented</code>,
+Python has a fallback: it tries the <em>right</em> operand's
+<strong>reverse dunder</strong> — <code>col("amount").__radd__(100)</code>.
+pyfloe defines these so both directions work:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — reverse operators</div>
+<pre><code><span class="kw">class</span> <span class="cl">Expr</span>:
+    <span class="kw">def</span> <span class="fn">__radd__</span>(<span class="va">self</span>, <span class="va">other</span>):
+        <span class="kw">return</span> BinaryExpr(_ensure_expr(<span class="va">other</span>), <span class="va">self</span>, _op.add, <span class="st">'+'</span>)
+    <span class="kw">def</span> <span class="fn">__rsub__</span>(<span class="va">self</span>, <span class="va">other</span>):
+        <span class="kw">return</span> BinaryExpr(_ensure_expr(<span class="va">other</span>), <span class="va">self</span>, _op.sub, <span class="st">'-'</span>)
+    <span class="kw">def</span> <span class="fn">__rmul__</span>(<span class="va">self</span>, <span class="va">other</span>):
+        <span class="kw">return</span> BinaryExpr(_ensure_expr(<span class="va">other</span>), <span class="va">self</span>, _op.mul, <span class="st">'*'</span>)
+    <span class="kw">def</span> <span class="fn">__rtruediv__</span>(<span class="va">self</span>, <span class="va">other</span>):
+        <span class="kw">return</span> BinaryExpr(_ensure_expr(<span class="va">other</span>), <span class="va">self</span>, _op.truediv, <span class="st">'/'</span>)</code></pre>
+
+<p>
+Notice the order is flipped: <code>_ensure_expr(other)</code> goes on
+the left, <code>self</code> on the right. Now <code>100 + col("amount")</code>
+correctly builds a <code>BinaryExpr</code> with <code>Lit(100)</code> on
+the left and <code>Col("amount")</code> on the right.
+</p>
+
+<h3>Edge case: the __bool__ trap</h3>
+
+<p>
+There's one more dangerous trap. Python's <code>and</code> and
+<code>or</code> <em>keywords</em> don't call <code>__and__</code> or
+<code>__or__</code>. They call <code>__bool__</code> and short-circuit.
+So if someone writes <code>col("a") > 5 and col("b") < 10</code>
+(using the keyword <code>and</code> instead of the operator
+<code>&amp;</code>), Python tries to convert the expression to a
+boolean — which makes no sense for an AST node.
+</p>
+
+<p>
+pyfloe prevents this with a guardrail:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — preventing accidental bool conversion</div>
+<pre><code><span class="kw">class</span> <span class="cl">Expr</span>:
+    <span class="kw">def</span> <span class="fn">__bool__</span>(<span class="va">self</span>):
+        <span class="kw">raise</span> <span class="cl">TypeError</span>(
+            <span class="st">'Cannot use an Expr as a Python bool. '</span>
+            <span class="st">'Use & / | for logical ops, and .collect() to evaluate.'</span>
+        )</code></pre>
+
+<div class="aside callout-red">
+  <div class="aside-title">A common Polars mistake</div>
+  If you've ever used Polars and gotten the error <em>"the truth value
+  of an Expr is ambiguous"</em>, now you know exactly why. It's this
+  <code>__bool__</code> guard. You used <code>and</code> (which calls
+  <code>__bool__</code>) instead of <code>&amp;</code> (which calls
+  <code>__and__</code>). Same mechanism, same fix.
+</div>
+
+<h3>Free bonus: operator precedence</h3>
+
+<p>
+Because pyfloe piggybacks on Python's native operators, it gets
+<strong>operator precedence for free</strong>. Just as <code>*</code>
+binds tighter than <code>+</code> in arithmetic
+(<code>1 + 2 * 3</code> means <code>1 + (2 * 3)</code>), Python's
+<code>&amp;</code> (AND) binds tighter than <code>|</code> (OR). This
+means compound filters work like you'd expect:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> & binds tighter than | — just like * binds tighter than +</div>
+<pre><code><span class="cm"># Arithmetic precedence:</span>
+<span class="nu">1</span> <span class="op">+</span> <span class="nu">2</span> <span class="op">*</span> <span class="nu">3</span>           <span class="cm"># means 1 + (2 * 3) = 7, not (1 + 2) * 3 = 9</span>
+
+<span class="cm"># Logical precedence — same idea:</span>
+<span class="va">a</span> <span class="op">|</span> <span class="va">b</span> <span class="op">&</span> <span class="va">c</span>           <span class="cm"># means a | (b & c), not (a | b) & c</span>
+
+<span class="cm"># In practice:</span>
+col(<span class="st">"vip"</span>) <span class="op">==</span> <span class="kw">True</span> <span class="op">|</span> (col(<span class="st">"region"</span>) <span class="op">==</span> <span class="st">"EU"</span>) <span class="op">&</span> (col(<span class="st">"amount"</span>) <span class="op">&gt;</span> <span class="nu">100</span>)
+<span class="cm"># The & binds first, then the |</span>
+<span class="cm"># = vip OR (region is EU AND amount > 100)</span></code></pre>
+
+<p>
+pyfloe doesn't need to implement any precedence logic itself — Python
+handles the order in which the dunder methods are called. When Python
+parses <code>a | b & c</code>, it calls <code>b.__and__(c)</code>
+first, then passes that result to <code>a.__or__(...)</code>. The
+expression tree is built in the correct order automatically.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">Watch out for comparisons</div>
+  There is one gotcha. Python's bitwise operators <code>&amp;</code> and
+  <code>|</code> have <em>higher</em> precedence than comparison
+  operators like <code>&gt;</code> and <code>==</code>. This means
+  <code>col("age") > 18 & col("active") == True</code> is parsed as
+  <code>col("age") > (18 & col("active")) == True</code> &mdash; completely
+  wrong. That's why you always need parentheses around each comparison:
+  <code>(col("age") > 18) & (col("active") == True)</code>. This isn't
+  a pyfloe quirk &mdash; it's a Python precedence rule, and Polars has
+  the exact same requirement.
+</div>
+
+<h3>The UnaryExpr — for single-operand operations</h3>
+
+<p>
+Not every operation has two sides. Negation (<code>-col("x")</code>) and
+logical NOT (<code>~col("active")</code>) have only one operand. pyfloe
+handles these with <code>UnaryExpr</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — UnaryExpr</div>
+<pre><code><span class="kw">class</span> <span class="cl">UnaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="dc">"""A unary operator applied to a single operand."""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">operand</span>: <span class="cl">Expr</span>, <span class="va">op</span>, <span class="va">op_str</span>: <span class="bi">str</span>):
+        <span class="va">self</span>.operand <span class="op">=</span> <span class="va">operand</span>
+        <span class="va">self</span>.op <span class="op">=</span> <span class="va">op</span>
+        <span class="va">self</span>.op_str <span class="op">=</span> <span class="va">op_str</span></code></pre>
+
+<p>
+<code>UnaryExpr</code> is also reused for method-style operations like
+<code>col("x").is_null()</code> and string methods like
+<code>col("name").str.upper()</code>. The operand is the inner
+expression, and the <code>op</code> is whatever function should be
+applied. One class, many uses.
+</p>
+
+<div class="aside">
+  <div class="aside-title">More than we'll cover</div>
+  pyfloe's expression system is larger than what we teach in this
+  module. It includes string methods (<code>.str.upper()</code>,
+  <code>.str.contains()</code>), datetime accessors
+  (<code>.dt.year()</code>, <code>.dt.truncate()</code>), conditional
+  logic (<code>when(...).otherwise(...)</code>), and window functions
+  (<code>row_number().over(...)</code>). We won't build all of these —
+  but they all follow the exact same pattern you've just learned:
+  a method call returns a new <code>Expr</code> node instead of
+  computing a value. Once you understand <code>BinaryExpr</code> and
+  <code>UnaryExpr</code>, the rest is just more of the same.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 2.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Lesson 2.3</span>
+  Giving the AST a Voice — The <code>eval()</code> Method
+</h2>
+
+<p>
+Building an AST is great. We can represent <code>col("age") > 28</code>
+as a tree of objects instead of an opaque lambda. But eventually, our
+engine actually needs to <strong>process data</strong>. It needs to hand
+a real row to this tree and get a result back: <code>True</code> or
+<code>False</code>, a number, a string.
+</p>
+
+<p>
+We do this by adding an <code>eval()</code> method to every node in the
+tree. Let's walk through each one.
+</p>
+
+<h3>How Col evaluates: looking up a column</h3>
+
+<p>
+When we evaluate a <code>Col</code> expression, we just need to extract
+that column's value from the row. But remember — pyfloe stores rows as
+tuples, not dictionaries. So we need a <code>col_map</code> that tells
+us which index corresponds to which column name:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — Col.eval</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">name</span>: <span class="bi">str</span>):
+        <span class="va">self</span>.name <span class="op">=</span> <span class="va">name</span>
+
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>, <span class="va">col_map</span>):
+        <span class="cm"># col_map tells us: "age" → index 1</span>
+        <span class="kw">return</span> <span class="va">row</span>[<span class="va">col_map</span>[<span class="va">self</span>.name]]</code></pre>
+
+<p>
+Let's trace it. If <code>row = ("Alice", 30, "EU")</code> and
+<code>col_map = {"name": 0, "age": 1, "region": 2}</code>, then
+<code>Col("age").eval(row, col_map)</code> does:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Tracing Col.eval</div>
+<pre><code><span class="va">row</span>[<span class="va">col_map</span>[<span class="st">"age"</span>]]
+<span class="va">row</span>[<span class="nu">1</span>]
+<span class="cm"># → 30</span></code></pre>
+
+<div class="aside callout-teal">
+  <div class="aside-title">Why tuples instead of dicts?</div>
+  pyfloe stores each row as a Python tuple, not a dictionary. Tuples
+  use about 40% less memory (no per-row key storage), they're faster to
+  create and iterate, and they're hashable — which matters for grouping
+  and joins. The <code>col_map</code> dictionary translates column names
+  to integer indices once, and then every row lookup is just
+  <code>row[index]</code>.
+</div>
+
+<h3>How Lit evaluates: always the same</h3>
+
+<p>
+A <code>Lit</code> expression is even simpler. It ignores the row
+entirely and always returns its stored constant:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — Lit.eval</div>
+<pre><code><span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>, <span class="va">col_map</span>):
+        <span class="kw">return</span> <span class="va">self</span>.value   <span class="cm"># always 28, always "EU", always 3.14</span></code></pre>
+
+<h3>How BinaryExpr evaluates: ask the children</h3>
+
+<p>
+Here's where the recursive magic happens. A <code>BinaryExpr</code>
+doesn't know what its children are. It doesn't care whether the left
+side is a <code>Col</code>, a <code>Lit</code>, or another
+<code>BinaryExpr</code>. It just asks each child to evaluate itself,
+then applies its operator to the results:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — BinaryExpr.eval</div>
+<pre><code><span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>, <span class="va">col_map</span>):
+        <span class="cm"># Ask the children to evaluate themselves recursively</span>
+        <span class="va">lv</span> <span class="op">=</span> <span class="va">self</span>.left.eval(<span class="va">row</span>, <span class="va">col_map</span>)
+        <span class="va">rv</span> <span class="op">=</span> <span class="va">self</span>.right.eval(<span class="va">row</span>, <span class="va">col_map</span>)
+        <span class="cm"># Handle NULLs gracefully</span>
+        <span class="kw">if</span> <span class="va">lv</span> <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> <span class="va">rv</span> <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">return</span> <span class="kw">None</span>
+        <span class="cm"># Apply the operator (e.g., operator.gt(30, 28) → True)</span>
+        <span class="kw">return</span> <span class="va">self</span>.op(<span class="va">lv</span>, <span class="va">rv</span>)</code></pre>
+
+<p>
+That <code>None</code> check is important. In real-world data, values
+are frequently missing. pyfloe follows the SQL convention: any
+comparison involving <code>None</code> returns <code>None</code>, not
+<code>True</code> or <code>False</code>. This is something a naive
+lambda-based filter would never handle correctly.
+</p>
+
+<h3>Tracing a compound expression</h3>
+
+<p>
+Let's trace a complete expression through construction <em>and</em>
+evaluation. Consider:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> A compound expression</div>
+<pre><code><span class="va">expr</span> <span class="op">=</span> (col(<span class="st">"price"</span>) <span class="op">*</span> col(<span class="st">"quantity"</span>)) <span class="op">&gt;</span> <span class="nu">1000</span></code></pre>
+
+<p>
+<strong>Step 1 — Build the tree.</strong> <code>col("price")</code>
+creates <code>Col("price")</code>. <code>col("quantity")</code> creates
+<code>Col("quantity")</code>. The <code>*</code> operator calls
+<code>__mul__</code>, producing a <code>BinaryExpr(*, ...)</code>. Then
+the <code>&gt;</code> operator calls <code>__gt__</code>, wrapping
+everything in a second <code>BinaryExpr(>, ...)</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> The tree Python built behind the scenes</div>
+<pre><code>BinaryExpr(op=<span class="st">">"</span>)
+├── left: BinaryExpr(op=<span class="st">"*"</span>)
+│   ├── left:  Col(<span class="st">"price"</span>)
+│   └── right: Col(<span class="st">"quantity"</span>)
+└── right: Lit(<span class="nu">1000</span>)</code></pre>
+
+<p>
+No data has been touched. No computation has happened. We've just built
+a <em>description</em> of what to compute.
+</p>
+
+<div style="margin: 32px 0; text-align: center;">
+<svg width="100%" viewBox="0 0 480 340" style="max-width: 480px;" xmlns="http://www.w3.org/2000/svg">
+  <!-- Root: > -->
+  <rect class="n-box n-bin" x="160" y="16" width="160" height="52"/>
+  <text class="n-type" x="240" y="34" text-anchor="middle" fill="#534AB7">BinaryExpr</text>
+  <text class="n-label" x="240" y="52" text-anchor="middle" fill="#534AB7">op: &gt;</text>
+
+  <!-- Left child: * -->
+  <rect class="n-box n-bin" x="40" y="120" width="175" height="52"/>
+  <text class="n-type" x="128" y="138" text-anchor="middle" fill="#534AB7">BinaryExpr</text>
+  <text class="n-label" x="128" y="156" text-anchor="middle" fill="#534AB7">op: *</text>
+
+  <!-- Right child: 1000 -->
+  <rect class="n-box n-lit" x="290" y="120" width="140" height="52"/>
+  <text class="n-type" x="360" y="138" text-anchor="middle" fill="#0F6E56">Lit</text>
+  <text class="n-label" x="360" y="156" text-anchor="middle" fill="#0F6E56">1000</text>
+
+  <!-- Leaf: col("price") -->
+  <rect class="n-box n-col" x="4" y="228" width="140" height="52"/>
+  <text class="n-type" x="74" y="246" text-anchor="middle" fill="#3D5A80">Col</text>
+  <text class="n-label" x="74" y="264" text-anchor="middle" fill="#3D5A80">"price"</text>
+
+  <!-- Leaf: col("quantity") -->
+  <rect class="n-box n-col" x="160" y="228" width="140" height="52"/>
+  <text class="n-type" x="230" y="246" text-anchor="middle" fill="#3D5A80">Col</text>
+  <text class="n-label" x="230" y="264" text-anchor="middle" fill="#3D5A80">"quantity"</text>
+
+  <!-- Edges -->
+  <line class="edge" x1="200" y1="68" x2="128" y2="120"/>
+  <line class="edge" x1="280" y1="68" x2="360" y2="120"/>
+  <line class="edge" x1="90" y1="172" x2="74" y2="228"/>
+  <line class="edge" x1="165" y1="172" x2="230" y2="228"/>
+
+  <!-- Labels on edges -->
+  <text class="n-type" x="152" y="98" fill="#9C9A92">left</text>
+  <text class="n-type" x="302" y="98" fill="#9C9A92">right</text>
+  <text class="n-type" x="62" y="206" fill="#9C9A92">left</text>
+  <text class="n-type" x="206" y="206" fill="#9C9A92">right</text>
+</svg>
+</div>
+
+<p>
+<strong>Pause and predict:</strong> given
+<code>row = ("Widget", 25.0, 4)</code> and the expression
+<code>(col("price") * col("quantity")) &gt; 1000</code>, what will
+the result be? Work it out in your head: what's 25.0 &times; 4, and
+is that greater than 1000? Then read on.
+</p>
+
+<p>
+<strong>Step 2 — Evaluate it.</strong> The engine has a row:
+<code>row = ("Widget", 25.0, 4)</code> and
+<code>col_map = {"name": 0, "price": 1, "quantity": 2}</code>.
+It calls <code>expr.eval(row, col_map)</code> and the tree walks itself:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Tracing eval through the tree</div>
+<pre><code><span class="cm"># Root: BinaryExpr(op=">") asks its children:</span>
+
+<span class="cm"># Left child: BinaryExpr(op="*") asks ITS children:</span>
+<span class="cm">#   Col("price").eval(...)    → row[1] → 25.0</span>
+<span class="cm">#   Col("quantity").eval(...) → row[2] → 4</span>
+<span class="cm">#   result: 25.0 * 4 = 100.0</span>
+
+<span class="cm"># Right child: Lit(1000).eval(...) → 1000</span>
+
+<span class="cm"># Root applies its operator: 100.0 > 1000 → False</span></code></pre>
+
+<p>
+Each node only knows how to get its children's values and apply its own
+operator. The root doesn't know anything about <code>"price"</code> or
+<code>"quantity"</code> — it just asks its left child for a number and
+its right child for a number. This recursive self-similarity is what
+makes ASTs so elegant — and so composable.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 2.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Lesson 2.4</span>
+  The Payoff — Inspectable Expressions
+</h2>
+
+<p>
+We've built the expression tree. We've given it a voice with
+<code>eval()</code>. But we haven't yet delivered on the
+<em>original promise</em> from Module 1: the reason we did all this
+work instead of just using lambdas.
+</p>
+
+<p>
+Remember the question that an optimizer needs to answer:
+<em>"Which columns does this expression actually use?"</em> With a
+lambda, we were stuck. With the AST, the answer writes itself.
+</p>
+
+<h3>required_columns: the method lambdas can't provide</h3>
+
+<p>
+We add one more method to each node. The logic is beautifully simple:
+leaf nodes know what they need, and branch nodes combine their children's
+needs:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — required_columns</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> {<span class="va">self</span>.name}          <span class="cm"># I need exactly one column</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="bi">set</span>()               <span class="cm"># I need nothing — I'm a constant</span>
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="cm"># Combine the requirements of both sides</span>
+        <span class="kw">return</span> <span class="va">self</span>.left.required_columns() <span class="op">|</span> <span class="va">self</span>.right.required_columns()
+
+<span class="kw">class</span> <span class="cl">UnaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="va">self</span>.operand.required_columns()</code></pre>
+
+<p>
+Now watch. Our optimizer can see the future:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> The optimizer can now see which columns matter</div>
+<pre><code><span class="va">expr</span> <span class="op">=</span> (col(<span class="st">"price"</span>) <span class="op">*</span> col(<span class="st">"quantity"</span>)) <span class="op">&gt;</span> <span class="nu">1000</span>
+<span class="va">expr</span>.required_columns()
+
+<span class="cm"># BinaryExpr(>).required_columns()</span>
+<span class="cm">#   → BinaryExpr(*).required_columns()  |  Lit(1000).required_columns()</span>
+<span class="cm">#   → ({"price"} | {"quantity"})         |  set()</span>
+<span class="cm">#   → {"price", "quantity"}</span></code></pre>
+
+<p>
+Two columns. If the CSV has 50 columns, the optimizer can now tell the
+scan node: <em>"Only read columns 1 and 2. Skip the other 48."</em>
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">This is the holy grail</div>
+  We have given the user a beautiful, highly readable API:
+  <code>col("price") * col("quantity") > 1000</code>. And at the same
+  time, we have built a transparent data structure that our future
+  Query Optimizer (Module 5) can use to aggressively prune columns and
+  push filters down the execution tree. The <em>same object</em> powers
+  both the user experience and the optimizer. That's what makes this
+  architecture so elegant.
+</div>
+
+<h3>Lambda vs. expression — the full picture</h3>
+
+<p>
+Here's the complete comparison — why we did all this work:
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-lambda">Lambda</span> Black box</h4>
+    <p>
+      <code>lambda row: row["price"] * row["qty"] > 1000</code><br><br>
+      The engine can <em>call</em> it, but can't look inside. It doesn't
+      know which columns are used. It can't rearrange or optimize anything.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-expr">Expression</span> Inspectable tree</h4>
+    <p>
+      <code>(col("price") * col("qty")) > 1000</code><br><br>
+      The engine can walk the tree, list the columns (<code>{"price", "qty"}</code>),
+      push the filter down before a join, and prune unused columns from the scan.
+    </p>
+  </div>
+</div>
+
+<h3>Debugging with __repr__</h3>
+
+<p>
+One more dunder makes development much nicer. Each expression class
+implements <code>__repr__</code> so that printing an expression reveals
+its full structure:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — __repr__ methods</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">__repr__</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="st">f'col("</span>{<span class="va">self</span>.name}<span class="st">")'</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">__repr__</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="bi">repr</span>(<span class="va">self</span>.value)
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">__repr__</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="st">f'(</span>{<span class="va">self</span>.left} {<span class="va">self</span>.op_str} {<span class="va">self</span>.right}<span class="st">)'</span></code></pre>
+
+<p>
+Because <code>__repr__</code> is recursive — <code>BinaryExpr</code>'s
+repr calls <code>repr(self.left)</code> and <code>repr(self.right)</code>,
+which call their own <code>__repr__</code> — you get a full round-trip
+view of the tree:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Expressions print almost exactly as you wrote them</div>
+<pre><code><span class="op">&gt;&gt;&gt;</span> (col(<span class="st">"price"</span>) <span class="op">*</span> col(<span class="st">"quantity"</span>)) <span class="op">&gt;</span> <span class="nu">1000</span>
+((<span class="va">col</span>(<span class="st">"price"</span>) <span class="op">*</span> <span class="va">col</span>(<span class="st">"quantity"</span>)) <span class="op">&gt;</span> <span class="nu">1000</span>)
+
+<span class="op">&gt;&gt;&gt;</span> (col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">18</span>) <span class="op">&amp;</span> (col(<span class="st">"active"</span>) <span class="op">==</span> <span class="kw">True</span>)
+((col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">18</span>) <span class="op">&amp;</span> (col(<span class="st">"active"</span>) <span class="op">==</span> <span class="kw">True</span>))</code></pre>
+
+<p>
+Three dunders — <code>__gt__</code>, <code>eval</code>,
+<code>__repr__</code> — all using the same recursive pattern, each
+cascading through the same tree, each producing a different kind of
+output. A tree of objects, a boolean, and a string. The AST is
+the common backbone.
+</p>
+
+<div class="aside">
+  <div class="aside-title">The production version</div>
+  Polars expressions, PySpark Column objects, SQLAlchemy clause elements — they
+  all overload Python operators to build ASTs. The dunder methods let you
+  write <code>col("a") + col("b")</code> instead of verbose constructor calls like
+  <code>BinaryExpr(Col("a"), Col("b"), operator.add, "+")</code>.
+</div>
+
+<details class="deep-dive">
+  <summary>Deep dive — From our version to pyfloe's real code</summary>
+  <div class="deep-dive-body">
+
+<p>
+Throughout this module, we built simplified versions of each class to
+understand the <em>shape</em> of the expression system. pyfloe's actual
+source code has the same shape — but adds production polish. Here's what
+the real code adds that we skipped over:
+</p>
+
+<p>
+<strong><code>__slots__</code></strong> — You may have noticed
+<code>__slots__ = ('name',)</code> on pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> class
+and <code>__slots__ = ('left', 'right', 'op', 'op_str')</code> on
+<code>BinaryExpr</code>. Normally, every Python object carries a hidden
+<code>__dict__</code> dictionary to store its attributes. That
+dictionary is flexible (you can add any attribute at runtime), but it
+costs about 100 extra bytes per object. When you declare
+<code>__slots__</code>, Python skips the <code>__dict__</code> entirely
+and stores attributes in a fixed-size internal array — roughly 40% less
+memory per instance.
+</p>
+
+<p>
+Why does that matter for expressions? Each node in the AST is tiny —
+just a few attributes. But a complex query might create thousands of
+expression nodes. And when the engine evaluates that expression across
+millions of rows, every byte counts. <code>__slots__</code> is a
+one-line declaration that eliminates that overhead for free.
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe/expr.py — __slots__ on every expression class</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    __slots__ <span class="op">=</span> (<span class="st">'name'</span>,)          <span class="cm"># only this attribute — no __dict__</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    __slots__ <span class="op">=</span> (<span class="st">'value'</span>,)         <span class="cm"># ~100 bytes saved per instance</span>
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    __slots__ <span class="op">=</span> (<span class="st">'left'</span>, <span class="st">'right'</span>, <span class="st">'op'</span>, <span class="st">'op_str'</span>)</code></pre>
+
+<pre data-executable data-label="__slots__ vs __dict__ — see the difference"><code>import sys
+
+class WithSlots:
+    __slots__ = ("key", "value")
+    def __init__(self, key: str, value: int):
+        self.key = key
+        self.value = value
+
+class WithoutSlots:
+    def __init__(self, key: str, value: int):
+        self.key = key
+        self.value = value
+
+a = WithSlots("price", 42)
+b = WithoutSlots("price", 42)
+
+# Memory comparison
+print(f"With __slots__:    {sys.getsizeof(a)} bytes")
+print(f"Without __slots__: {sys.getsizeof(b)} + {sys.getsizeof(b.__dict__)} bytes (__dict__)")
+print()
+
+# __dict__ exists only on the non-slots class
+print(f"b.__dict__ = {b.__dict__}")
+try:
+    print(f"a.__dict__ = {a.__dict__}")
+except AttributeError as e:
+    print(f"a.__dict__ → AttributeError: {e}")
+print()
+
+# You can add arbitrary attributes without slots...
+b.new_attr = "surprise!"
+print(f"b.new_attr = {b.new_attr!r}  (anything goes)")
+
+# ...but slots locks it down
+try:
+    a.new_attr = "nope"
+except AttributeError as e:
+    print(f"a.new_attr → AttributeError: {e}")
+print()
+
+# At scale this matters: 10,000 expression nodes
+slots_total = sum(sys.getsizeof(WithSlots("x", i)) for i in range(10_000))
+dict_total = sum(sys.getsizeof(WithoutSlots("x", i)) + sys.getsizeof(WithoutSlots("x", i).__dict__) for i in range(10_000))
+print(f"10k slots objects:  {slots_total:>10,} bytes")
+print(f"10k dict objects:   {dict_total:>10,} bytes")
+print(f"Savings:            {dict_total - slots_total:>10,} bytes ({(dict_total - slots_total) / dict_total:.0%})")</code></pre>
+
+<p>
+<strong><code>compile()</code></strong> — In addition to <code>eval()</code>,
+pyfloe has a <code>compile(col_map)</code> method that pre-bakes the
+column index lookup into a closure. Instead of doing a dictionary lookup
+on every row, the compiled version is <code>lambda row: row[1]</code>
+— the index <code>1</code> is already baked in. This is significantly
+faster for tight loops over millions of rows.
+</p>
+
+<p>
+<strong><code>output_dtype()</code></strong> — Each expression can
+report what type it will produce (<code>bool</code> for comparisons,
+<code>float</code> for division, etc.). This enables type inference:
+pyfloe can tell you the schema of a query result <em>before running
+any data through it</em>.
+</p>
+
+  </div>
+</details>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Coming in Module 3</div>
+  We have expressions — but right now they're inert. They're objects
+  sitting in memory, disconnected from any data. To make them
+  <em>do</em> something, we need to plug them into the plan nodes from
+  Module 1. That's where the two trees we've been building finally meet:
+  the <code>FilterNode</code> receives an <code>Expr</code>, compiles
+  it, and evaluates it against every row flowing through the volcano
+  pipeline. We'll also tackle a performance problem — calling
+  <code>eval()</code> once per row is brutally slow in Python — and
+  solve it with batched execution.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2 id="exercises">
+  <span class="lesson-num">Exercises</span>
+  Check Your Understanding
+</h2>
+
+<p>
+Before moving to Module 3, make sure these concepts are solid:
+</p>
+
+<div class="interactive-box" id="quiz-container">
+  <h4>Quick check</h4>
+
+  <div id="quiz">
+    <div id="q1" class="quiz-question">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        1. When you write <code>col("age") > 28</code>, what does Python actually call?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">operator.gt(col("age"), 28)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, true)">col("age").__gt__(28)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">compare(col("age"), 28)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">col("age").filter(28)</button>
+      </div>
+      <div id="feedback-1" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q2" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        2. What does <code>_ensure_expr(42)</code> return?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">The integer 42</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">Col("42")</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, true)">Lit(42)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">BinaryExpr(42)</button>
+      </div>
+      <div id="feedback-2" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q3" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        3. What does <code>(col("a") + col("b")).required_columns()</code> return?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">{"a + b"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, true)">{"a", "b"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">{"a"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">set()</button>
+      </div>
+      <div id="feedback-3" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q4" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        4. Why does pyfloe define <code>__radd__</code> in addition to <code>__add__</code>?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">For better performance</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, true)">So <code>100 + col("x")</code> works</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">To handle None values</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">For Python 2 compatibility</button>
+      </div>
+      <div id="feedback-4" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q5" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        5. Why does <code>Expr</code> define <code>__bool__</code> to raise a <code>TypeError</code>?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Expressions can't be True or False</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">To save memory</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, true)">To catch <code>and</code>/<code>or</code> misuse — use <code>&</code>/<code>|</code> instead</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Python requires it for custom classes</button>
+      </div>
+      <div id="feedback-5" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q6" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        6. You build two expressions: <code>e1 = col("x") + col("y")</code> and
+        <code>e2 = col("z") &gt; 10</code>. What does
+        <code>e1.required_columns() | e2.required_columns()</code> return?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(6, this, true)">{"x", "y", "z"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(6, this, false)">{"x + y", "z > 10"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(6, this, false)">{"x", "y"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(6, this, false)">set()</button>
+      </div>
+      <div id="feedback-6" class="output-box" style="display: none;"></div>
+    </div>
+  </div>
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- HANDS-ON CHALLENGE -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">Challenge</span>
+  Build a NegExpr Node
+</h2>
+
+<p>
+You've built <code>BinaryExpr</code> for two-operand operations. Now build
+<code>NegExpr</code> — a <em>unary</em> expression that negates its child.
+It should support <code>-col("price")</code> by implementing the
+<code>__neg__</code> dunder method on <code>Expr</code>.
+</p>
+
+<p>Think about:</p>
+<ul>
+  <li>How many children does a unary node have? (Just one.)</li>
+  <li>What should <code>required_columns()</code> return?</li>
+  <li>What should <code>eval(row)</code> do?</li>
+</ul>
+
+<div class="code-label"><span class="dot dot-python"></span> Starter code — implement NegExpr</div>
+<pre data-executable data-expanded data-label="Hands-on: build a NegExpr"><code>class Expr:
+    def required_columns(self):
+        return set()
+    def eval(self, row):
+        raise NotImplementedError
+    def __neg__(self):
+        # TODO: return a NegExpr wrapping self
+        pass
+    def __gt__(self, other):
+        return BinaryExpr(self, other if isinstance(other, Expr) else Lit(other), lambda a, b: a > b, ">")
+
+class Col(Expr):
+    def __init__(self, name):
+        self.name = name
+    def required_columns(self):
+        return {self.name}
+    def eval(self, row):
+        return row[self.name]
+
+class Lit(Expr):
+    def __init__(self, value):
+        self.value = value
+    def eval(self, row):
+        return self.value
+
+class BinaryExpr(Expr):
+    def __init__(self, left, right, op, op_str):
+        self.left, self.right, self.op, self.op_str = left, right, op, op_str
+    def required_columns(self):
+        return self.left.required_columns() | self.right.required_columns()
+    def eval(self, row):
+        return self.op(self.left.eval(row), self.right.eval(row))
+
+class NegExpr(Expr):
+    def __init__(self, child):
+        self.child = child
+    def required_columns(self):
+        # TODO
+        pass
+    def eval(self, row):
+        # TODO
+        pass
+
+# Test it:
+row = {"price": 42, "discount": 5}
+
+neg_price = -Col("price")
+print(f"-col('price') => type: {type(neg_price).__name__}")
+print(f"-col('price') => eval:  {neg_price.eval(row)}")
+print(f"-col('price') => cols:  {neg_price.required_columns()}")
+
+# Compose it: -col("price") > -50
+expr = -Col("price") > -50
+print(f"\n-col('price') > -50 => {expr.eval(row)}")</code></pre>
+
+<button class="btn" onclick="document.getElementById('m2-solution').style.display = document.getElementById('m2-solution').style.display === 'none' ? 'block' : 'none'" style="margin-top: 16px;">Show Solution</button>
+
+<div id="m2-solution" style="display: none; margin-top: 16px;">
+<div class="code-label"><span class="dot dot-better"></span> NegExpr — unary node with one child</div>
+<pre><code><span class="kw">class</span> <span class="cl">NegExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>):
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="va">self</span>.child.required_columns()
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>):
+        <span class="kw">return</span> <span class="op">-</span><span class="va">self</span>.child.eval(<span class="va">row</span>)</code></pre>
+<p>
+The key insight: a unary node delegates everything to its single child.
+<code>required_columns()</code> passes through unchanged.
+<code>eval()</code> negates its child's value. And <code>__neg__</code>
+on <code>Expr</code> is just <code>return NegExpr(self)</code> — the same
+pattern as <code>__add__</code> returning <code>BinaryExpr</code>.
+This is how pyfloe implements <code>abs()</code>, <code>~</code> (not),
+and other unary operations.
+</p>
+</div>
+
+<hr class="separator">
+
+<div class="source-references">
+  <h3>Source References</h3>
+  <h4>expr.py — Expression AST</h4>
+  <ul>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Expr" class="source-link" target="_blank" rel="noopener"><code>Expr</code></a> — base class for all expressions</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a> — returns the set of columns an expression needs</li>
+  </ul>
+</div>
+
+<hr class="separator">
+
+<script>
+const answers = {
+  1: {
+    correct: "Exactly. Python translates the > operator into a method call on the left operand. col(\"age\").__gt__(28) is what actually runs — and because Expr defines __gt__ to return a BinaryExpr, you get a tree node instead of a boolean.",
+    wrong: "Not quite. Python translates operators into dunder method calls on the left operand. So col(\"age\") > 28 becomes col(\"age\").__gt__(28). Because Expr defines __gt__ to return a BinaryExpr, you get a tree node — not a boolean."
+  },
+  2: {
+    correct: "Yes! _ensure_expr checks if the value is already an Expr. Since 42 is a plain integer, it wraps it as Lit(42). This is why you can write col(\"price\") * 0.9 without explicitly calling lit(0.9) — the dunder method auto-wraps it.",
+    wrong: "Not quite. _ensure_expr wraps raw Python values in Lit() so they can participate in the expression tree. 42 is a plain integer, so it becomes Lit(42) — a leaf node that always evaluates to 42."
+  },
+  3: {
+    correct: "Exactly. BinaryExpr.required_columns() returns the union of its children's required columns. Col(\"a\") needs {\"a\"}, Col(\"b\") needs {\"b\"}, and the union is {\"a\", \"b\"}. This is the information that makes optimization possible — the exact thing lambdas couldn't provide.",
+    wrong: "Not quite. required_columns() walks the tree recursively. The + node asks both children. Col(\"a\") returns {\"a\"}, Col(\"b\") returns {\"b\"}, and the union is {\"a\", \"b\"}."
+  },
+  4: {
+    correct: "Right. When you write 100 + col(\"x\"), Python first tries int.__add__(col(\"x\")), which returns NotImplemented. Then Python falls back to col(\"x\").__radd__(100), which builds the correct BinaryExpr with Lit(100) on the left.",
+    wrong: "Not quite. __radd__ exists so that expressions like 100 + col(\"x\") work. Python tries int.__add__ first, gets NotImplemented, then falls back to col(\"x\").__radd__(100). Without __radd__, you'd get a TypeError."
+  },
+  5: {
+    correct: "Exactly. Python's 'and' and 'or' keywords call __bool__() and short-circuit — they can't be overloaded to build expression trees. By raising TypeError, pyfloe catches the mistake early and tells the user to use & and | instead. This is the same error Polars users see.",
+    wrong: "Not quite. The problem is Python's 'and'/'or' keywords, which call __bool__() instead of __and__/__or__. If __bool__ returned True or False, the expression tree would silently collapse. Raising TypeError catches this mistake and tells users to use & and | instead."
+  },
+  6: {
+    correct: "Yes! Each expression's required_columns() walks its tree: e1 needs {\"x\", \"y\"} (from two Col nodes), e2 needs {\"z\"} (from one Col node — Lit(10) needs nothing). The | operator is Python's set union, so you get {\"x\", \"y\", \"z\"}. This is exactly how the optimizer figures out which columns a complex predicate touches.",
+    wrong: "Not quite. required_columns() returns a set of column name strings, not expression descriptions. Col(\"x\") returns {\"x\"}, Lit(10) returns set(). BinaryExpr combines its children with set union. So e1 gives {\"x\", \"y\"}, e2 gives {\"z\"}, and the union is {\"x\", \"y\", \"z\"}."
+  }
+};
+
+function checkAnswer(q, btn, correct) {
+  const feedback = document.getElementById('feedback-' + q);
+  const btns = btn.parentElement.querySelectorAll('.quiz-btn');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+  btn.style.opacity = '1';
+
+  if (correct) {
+    btn.style.borderColor = '#0F6E56';
+    btn.style.background = '#E1F5EE';
+    btn.style.color = '#0F6E56';
+    feedback.className = 'output-box';
+    feedback.textContent = answers[q].correct;
+  } else {
+    btn.style.borderColor = '#A32D2D';
+    btn.style.background = '#FCEBEB';
+    btn.style.color = '#A32D2D';
+    feedback.className = 'output-box error';
+    feedback.textContent = answers[q].wrong;
+  }
+  feedback.style.display = 'block';
+}
+</script>

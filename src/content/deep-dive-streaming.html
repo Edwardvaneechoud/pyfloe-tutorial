@@ -1,0 +1,1115 @@
+<h1>Streaming<br><em>I/O</em></h1>
+
+<div class="aside callout-purple" style="margin-bottom: 32px;">
+  <div class="aside-title">Bonus material</div>
+  This deep dive is optional — it doesn't feed into the remaining modules.
+  If you've just finished Module 5, the main course arc is complete. Come
+  back to this when you're curious about how pyfloe handles file I/O with
+  constant memory, or when you want to see the generator patterns from
+  Module 1 applied to a realistic streaming scenario.
+</div>
+
+<p class="subtitle">
+"Streaming" is the tech industry's favorite buzzword. Kafka. Flink. Event-driven
+architecture. Real-time pipelines. It sounds like a revolution — a fundamentally
+new way of thinking about data. But here's the thing: <strong>you already built it.</strong>
+</p>
+
+<p>
+Remember Module 1? You wrote a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> that used <code>yield</code>
+to pull rows one at a time through the volcano model. That <em>was</em> streaming.
+One row in memory, processed, discarded, next row. The entire architecture you've
+spent five modules building — generators, plan nodes, lazy evaluation — is a
+streaming architecture. You just didn't call it that.
+</p>
+
+<p>
+This deep dive makes that connection explicit. We'll build a realistic
+monitoring pipeline — a simulated web server emitting an <strong>infinite</strong>
+stream of HTTP logs — and show how pyfloe reads it, enriches it, aggregates
+it, and writes it to disk, all with constant memory. None of it requires
+new concepts. It's all generators and factories and the same
+<code>execute()</code> method you already know.
+</p>
+
+<p>
+The point of this module is not to teach you something new. It's to show you
+that you <em>already understand</em> the thing — the core mechanism is simpler
+than the buzzwords suggest.
+</p>
+
+<div class="download-box">
+  <div class="download-icon">📦</div>
+  <div class="dl-text">
+    <div class="dl-title">streaming_demo.py — Companion Script</div>
+    <p class="dl-desc">
+      A runnable Python script that implements every example in this deep dive.
+      An infinite HTTP log generator, LazyFrame pipelines with joins and
+      aggregations, a flat-loop <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> pipeline, a live rolling
+      dashboard, and a timing comparison. Download it and run it alongside
+      this lesson.
+    </p>
+  </div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">In this deep dive</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">D.1</span> The Iterator Factory Pattern</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">D.2</span> Constant-Memory File Reading</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">D.3</span> Constant-Memory Writing</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">D.4</span> The Stream Pipeline — Skipping the Tree</a>
+  <a class="toc-item" href="#exercises"><span class="toc-num">&bull;</span> Exercises</a>
+</nav>
+
+
+<!-- ============================================================ -->
+<!-- LESSON D.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Section D.1</span>
+  The Iterator Factory Pattern
+</h2>
+
+<p>
+Let's start with a generator you can't load into Pandas.
+</p>
+
+<h3>An infinite stream</h3>
+
+<p>
+Our companion demo simulates a live web server. The function
+<code>http_log_stream()</code> yields structured log records — one per HTTP
+request — with timestamps, endpoints, status codes, and latencies.
+With the default <code>limit=None</code>, it <em>never stops</em>.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> The infinite log generator (streaming_demo.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">http_log_stream</span>(<span class="op">*</span>, <span class="va">limit</span><span class="op">=</span><span class="kw">None</span>, <span class="va">delay</span><span class="op">=</span><span class="nu">0.0</span>):
+    <span class="st">"""Simulate a live web server emitting log records.
+    With limit=None this generator never terminates."""</span>
+    <span class="va">count</span> <span class="op">=</span> <span class="nu">0</span>
+    <span class="kw">while</span> <span class="va">limit</span> <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> <span class="va">count</span> <span class="op">&lt;</span> <span class="va">limit</span>:
+        <span class="va">status</span> <span class="op">=</span> <span class="va">random</span>.<span class="fn">choices</span>(<span class="va">STATUS_CODES</span>, <span class="va">weights</span><span class="op">=</span><span class="va">STATUS_WEIGHTS</span>, <span class="va">k</span><span class="op">=</span><span class="nu">1</span>)[<span class="nu">0</span>]
+        <span class="va">latency</span> <span class="op">=</span> <span class="fn">max</span>(<span class="nu">50</span>, <span class="va">random</span>.<span class="fn">gauss</span>(<span class="nu">1500</span>, <span class="nu">400</span>)) <span class="kw">if</span> <span class="va">status</span> <span class="op">&gt;=</span> <span class="nu">500</span> \
+            <span class="kw">else</span> <span class="fn">max</span>(<span class="nu">5</span>, <span class="va">random</span>.<span class="fn">gauss</span>(<span class="nu">120</span>, <span class="nu">80</span>))
+
+        <span class="kw">yield</span> {
+            <span class="st">"ts"</span>:         <span class="va">ts</span>.<span class="fn">strftime</span>(<span class="st">"%Y-%m-%d %H:%M:%S.%f"</span>),
+            <span class="st">"method"</span>:     <span class="va">random</span>.<span class="fn">choice</span>(<span class="va">METHODS</span>),
+            <span class="st">"path"</span>:       <span class="va">random</span>.<span class="fn">choice</span>(<span class="va">ENDPOINTS</span>),
+            <span class="st">"status"</span>:     <span class="va">status</span>,
+            <span class="st">"latency_ms"</span>: <span class="bi">round</span>(<span class="va">latency</span>, <span class="nu">2</span>),
+            <span class="st">"deploy_id"</span>:  <span class="va">random</span>.<span class="fn">choice</span>(<span class="va">DEPLOY_IDS</span>),
+        }
+        <span class="va">count</span> <span class="op">+=</span> <span class="nu">1</span></code></pre>
+
+<p>
+Try calling <code>list(http_log_stream())</code> and your program hangs
+forever — there's no end to iterate toward. Try loading it into Pandas and
+you'll watch your RAM climb until the OS kills the process. An infinite
+generator is the purest forcing function for streaming: you <em>cannot</em>
+materialize it. You must process it lazily, one record at a time.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">You cannot load this</div>
+  <code>list(http_log_stream())</code> hangs. <code>pd.DataFrame(http_log_stream())</code>
+  hangs. Any tool that tries to consume the entire iterator before processing
+  it will never return. This is why streaming architecture exists — not because
+  it's trendy, but because some data sources <em>never end</em>.
+</div>
+
+<p>
+Of course, in our demo we'll use <code>limit=10_000</code> to keep things
+finite. But the design must handle the infinite case — and once it does,
+finite files are just a special case.
+</p>
+
+<h3>The one-shot problem</h3>
+
+<p>
+Even with a finite limit, generators have a subtle trap. They're single-pass
+iterators — once exhausted, they yield nothing forever. Watch what happens
+when you pass a generator to <code>from_iter()</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Passing a generator directly — the one-shot trap</div>
+<pre><code><span class="va">gen</span> <span class="op">=</span> <span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">100</span>)
+<span class="va">lf</span> <span class="op">=</span> <span class="fn">from_iter</span>(<span class="va">gen</span>)
+
+<span class="bi">len</span>(<span class="va">lf</span>.<span class="fn">to_pylist</span>())   <span class="cm"># → 100  ✓</span>
+<span class="bi">len</span>(<span class="va">lf</span>.<span class="fn">to_pylist</span>())   <span class="cm"># → 0    ✗  generator is spent!</span></code></pre>
+
+<p>
+The first <code>.to_pylist()</code> drains the generator. The second call
+gets nothing — the generator is exhausted, and <code>next()</code> just raises
+<code>StopIteration</code> forever. This kills repeatability. You can't
+call <code>.explain()</code> and then <code>.collect()</code>. You can't
+test a pipeline and then run it for real.
+</p>
+
+<p>
+The fix is embarrassingly simple. Don't store the generator. Store a
+<em>function that creates</em> a fresh generator every time you call it.
+</p>
+
+<h3>The factory: a function that returns a generator</h3>
+
+<div class="code-label"><span class="dot dot-better"></span> Passing a factory — replayable forever</div>
+<pre><code><span class="cm"># Pass a lambda, not the generator itself</span>
+<span class="va">lf</span> <span class="op">=</span> <span class="fn">from_iter</span>(<span class="kw">lambda</span>: <span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">100</span>))
+
+<span class="bi">len</span>(<span class="va">lf</span>.<span class="fn">to_pylist</span>())   <span class="cm"># → 100  ✓</span>
+<span class="bi">len</span>(<span class="va">lf</span>.<span class="fn">to_pylist</span>())   <span class="cm"># → 100  ✓  fresh generator every time!</span>
+<span class="bi">len</span>(<span class="va">lf</span>.<span class="fn">to_pylist</span>())   <span class="cm"># → 100  ✓  unlimited replays</span></code></pre>
+
+<p>
+Each call to the lambda creates a brand-new generator. The lambda itself is
+tiny — a stateless function object. The underlying <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" class="source-link" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a>
+calls this factory every time <code>execute_batched()</code> runs, getting
+a fresh stream of data.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The pattern in one sentence</div>
+  A <strong>factory function</strong> is a callable that returns a fresh
+  iterator. By storing the factory instead of the iterator, any plan node can
+  re-read its source data as many times as needed — each call creates a new
+  stream.
+</div>
+
+<pre data-executable data-label="Generator factory pattern"><code># The one-shot trap: generators exhaust after one pass
+def counting_gen(n):
+    for i in range(n):
+        yield {"id": i, "value": i * 10}
+
+gen = counting_gen(5)
+print("First pass:", list(gen))
+print("Second pass:", list(gen))  # empty!
+
+print()
+
+# The fix: store a FACTORY (a function that creates generators)
+factory = lambda: counting_gen(5)
+print("First pass (factory):", list(factory()))
+print("Second pass (factory):", list(factory()))  # works!
+print("Third pass (factory):", list(factory()))   # unlimited replays</code></pre>
+
+<p>
+This is not a new concept — it's a closure. The factory closes over whatever
+state it needs (a file path, a URL, a <code>limit</code> parameter) and uses
+it each time it's called. You've been writing closures since early Python.
+But here it solves a very real engineering problem: making a streaming data
+source repeatable.
+</p>
+
+<h3>pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" class="source-link" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a></h3>
+
+<p>
+In Module 3, you saw <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> — it holds data in a list and
+iterates over it. For streaming sources, pyfloe uses a different leaf node:
+<code>IteratorSourceNode</code>. Its <code>execute_batched()</code> method
+calls the factory to get a fresh generator on every execution.
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's IteratorSourceNode (plan.py)</div>
+<pre><code><span class="kw">class</span> <span class="cl">IteratorSourceNode</span>(<span class="cl">PlanNode</span>):
+    <span class="st">"""Leaf node that reads from a lazily-evaluated
+    iterator factory."""</span>
+
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"_columns"</span>, <span class="st">"_schema"</span>, <span class="st">"_factory"</span>, <span class="st">"_source_label"</span>)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">columns</span>, <span class="va">lazy_schema</span>,
+                 <span class="va">iterator_factory</span>, <span class="va">source_label</span><span class="op">=</span><span class="st">"Iterator"</span>):
+        <span class="va">self</span>.<span class="va">_columns</span> <span class="op">=</span> <span class="va">columns</span>
+        <span class="va">self</span>.<span class="va">_schema</span> <span class="op">=</span> <span class="va">lazy_schema</span>
+        <span class="va">self</span>.<span class="va">_factory</span> <span class="op">=</span> <span class="va">iterator_factory</span>   <span class="cm"># ← a callable, not a generator</span>
+        <span class="va">self</span>.<span class="va">_source_label</span> <span class="op">=</span> <span class="va">source_label</span>
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="fn">_batched</span>(<span class="va">self</span>.<span class="va">_factory</span>())  <span class="cm"># ← calls the factory each time</span></code></pre>
+
+<p>
+Look at <code>execute_batched</code>. It calls <code>self._factory()</code> —
+with parentheses — to get a new iterator, then wraps it in <code>_batched()</code>
+to yield it in chunks of 1,024 rows (the same batching helper from Module 3).
+Every call to <code>execute_batched</code> gets a fresh read.
+</p>
+
+<p>
+Compare this to <code>ScanNode</code>, which holds <code>self._data</code> as
+a plain list. <code>ScanNode</code> is for in-memory data that already exists.
+<code>IteratorSourceNode</code> is for data that lives somewhere else — a file,
+an API, a generator — and needs to be re-created on demand. Same interface,
+same <code>execute()</code> / <code>execute_batched()</code> contract. The rest
+of the plan tree can't tell the difference.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  This is why <code>read_csv("big.csv").to_pylist()</code> works twice in a
+  row. Polars does the same thing — <code>scan_csv()</code> creates a plan node
+  with a factory that reopens the file on each evaluation. The word "scan"
+  literally means "I'll read it when you ask me to." Your plan tree doesn't
+  hold data. It holds a <em>promise</em> of data.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON D.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Section D.2</span>
+  Constant-Memory File Reading
+</h2>
+
+<p>
+Our <code>http_log_stream()</code> yields Python dicts — pyfloe can infer
+the types at runtime. But what about CSV files, where every value arrives
+as a raw string? This is where the factory pattern meets real I/O, and where
+we encounter the one genuinely tricky problem in the whole streaming story:
+<strong>type inference</strong>.
+</p>
+
+<h3>The eager alternative (and why it doesn't work)</h3>
+
+<p>
+Pandas reads the entire file into memory:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Pandas-style: load everything</div>
+<pre><code><span class="kw">import</span> <span class="va">pandas</span> <span class="kw">as</span> <span class="va">pd</span>
+<span class="va">df</span> <span class="op">=</span> <span class="va">pd</span>.<span class="fn">read_csv</span>(<span class="st">"errors.csv"</span>)  <span class="cm"># 10 GB file → 10 GB in RAM</span></code></pre>
+
+<p>
+For a 10 GB CSV on a machine with 8 GB of RAM, this crashes. Pandas needs to
+see every row to infer types, build the DataFrame, and construct its NumPy
+arrays. The entire file must fit in memory.
+</p>
+
+<p>
+We want something different. We want to <em>sample</em> a few rows to figure
+out types, then yield the rest one row at a time, never holding more than a
+single row in memory.
+</p>
+
+<h3>Two-phase reading: sample, then stream</h3>
+
+<p>
+pyfloe's CSV reader does its work in two phases. Phase one happens at
+<em>read time</em> (when you call <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_csv" class="source-link" target="_blank" rel="noopener"><code>read_csv()</code></a>). Phase two happens
+at <em>execution time</em> (when you call <code>.collect()</code> or
+<code>.to_csv()</code>).
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-before">Phase 1</span> At read time</h4>
+    <p>
+      Open the file. Read the header. Sample 100 rows for type inference.
+      Close the file. Build a schema. Build a factory function.
+      <strong>No data is stored.</strong>
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-after">Phase 2</span> At execution time</h4>
+    <p>
+      The factory reopens the file. Yields rows one at a time as typed tuples.
+      Each row is consumed by the plan tree and discarded.
+      <strong>O(1) memory.</strong>
+    </p>
+  </div>
+</div>
+
+<p>
+Phase 1 is the clever part. The file is opened, the header is read, and
+a small sample (100 rows by default) is consumed. From these 100 rows,
+pyfloe infers the type of every column — integers, floats, booleans, strings,
+and even datetimes. Then the file is closed. The only things kept in memory
+are the column names, the inferred types, and a factory function that knows
+how to reopen the file later.
+</p>
+
+<h3>Type inference: the type ladder</h3>
+
+<p>
+Each cell in the sample is tested against a hierarchy of types, from most
+specific to least:
+</p>
+
+<div class="flow-diagram"><span class="data">bool</span> <span class="dim">→</span> <span class="data">int</span> <span class="dim">→</span> <span class="data">float</span> <span class="dim">→</span> <span class="data">str</span>
+<span class="dim">          ↑</span>
+<span class="dim">    first match wins</span></div>
+
+<p>
+If a cell parses as <code>bool</code>, that's its type. If not,
+try <code>int</code>. Then <code>float</code>. If nothing works, it's a
+<code>str</code>. Within a column, types are promoted using a lattice:
+<code>int + float → float</code>, <code>anything + str → str</code>, and
+<code>T + None → T(nullable)</code>.
+</p>
+
+<details class="deep-dive">
+<summary>How datetime detection works</summary>
+<div class="deep-dive-body">
+<p>
+After the basic pass, there's a second pass specifically for datetimes.
+Any column still typed as <code>str</code> gets checked: can the first
+successfully-parsed value's format be used as a template? If 80% or more of the
+sample values parse against that format, the column is retyped as
+<code>datetime</code> and the detected format string is cached. This
+avoids the cost of trying 14 different <code>strptime</code> patterns on every
+cell during streaming — datetime detection runs once per column on the sample, not per value.
+</p>
+</div>
+</details>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The tradeoff of sampling</div>
+  Type inference from a 100-row sample is fast and memory-efficient, but it's
+  a bet: you're assuming the sample is representative. If row 101 contains a
+  string in a column inferred as <code>int</code>, the cast will fail at
+  execution time. This is the fundamental tradeoff — you gain O(1) memory
+  but trade away guaranteed type safety across the whole file. Polars makes
+  the same tradeoff with <code>scan_csv()</code>.
+</div>
+
+<h3>The factory function</h3>
+
+<p>
+After type inference, <code>_read_delimited()</code> constructs the factory.
+Here's the core of it:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's CSV factory (io.py, simplified)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_read_delimited</span>(<span class="va">path</span>, <span class="va">delimiter</span>, <span class="va">has_header</span>, ...):
+    <span class="cm"># Phase 1: sample and infer types (at read time)</span>
+    <span class="kw">with</span> <span class="bi">open</span>(<span class="va">path</span>) <span class="kw">as</span> <span class="va">f</span>:
+        <span class="va">reader</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">reader</span>(<span class="va">f</span>, <span class="va">delimiter</span><span class="op">=</span><span class="va">delimiter</span>)
+        <span class="va">header</span> <span class="op">=</span> <span class="bi">next</span>(<span class="va">reader</span>)
+        <span class="va">col_names</span> <span class="op">=</span> [<span class="va">h</span>.<span class="fn">strip</span>() <span class="kw">for</span> <span class="va">h</span> <span class="kw">in</span> <span class="va">header</span>]
+        <span class="va">sample</span> <span class="op">=</span> [<span class="bi">next</span>(<span class="va">reader</span>) <span class="kw">for</span> <span class="va">_</span> <span class="kw">in</span> <span class="bi">range</span>(<span class="nu">100</span>)]
+
+    <span class="va">schema</span>, <span class="va">col_types</span>, <span class="va">dt_formats</span> <span class="op">=</span> <span class="fn">_infer_schema</span>(<span class="va">col_names</span>, <span class="va">sample</span>)
+
+    <span class="cm"># Phase 2: the factory (called at execution time)</span>
+    <span class="kw">def</span> <span class="fn">make_rows</span>():
+        <span class="kw">with</span> <span class="bi">open</span>(<span class="va">path</span>) <span class="kw">as</span> <span class="va">f</span>:
+            <span class="va">reader</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">reader</span>(<span class="va">f</span>, <span class="va">delimiter</span><span class="op">=</span><span class="va">delimiter</span>)
+            <span class="bi">next</span>(<span class="va">reader</span>)                  <span class="cm"># skip header</span>
+            <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">reader</span>:
+                <span class="kw">yield</span> <span class="bi">tuple</span>(
+                    <span class="fn">_cast_value</span>(<span class="va">row</span>[<span class="va">i</span>], <span class="va">col_types</span>[<span class="va">i</span>], <span class="va">dt_formats</span>[<span class="va">i</span>])
+                    <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="bi">range</span>(<span class="va">n_cols</span>)
+                )
+
+    <span class="kw">return</span> <span class="cl">_FileStreamNode</span>(<span class="va">col_names</span>, <span class="va">schema</span>, <span class="va">make_rows</span>)</code></pre>
+
+<p>
+Notice what the factory closes over: <code>path</code>, <code>col_types</code>,
+and <code>dt_formats</code>. These are tiny — a string and two short lists.
+The factory itself does zero I/O until it's called. When it <em>is</em> called,
+it opens the file fresh, skips the header, and yields each row as a typed tuple.
+One row in memory at a time.
+</p>
+
+<p>
+The <code>with</code> statement inside the generator ensures the file handle
+is closed when the generator finishes or is garbage-collected — which happens
+as soon as the plan tree finishes consuming rows, or when <code>.head(10)</code>
+stops pulling after 10 rows.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Why tuples, not dicts</div>
+  Every row is yielded as a <code>tuple</code>, not a <code>dict</code>. You
+  saw this in Module 3 — tuples are ~40% smaller (no key storage per row),
+  faster to create, and hashable (needed for joins and group-by). The mapping
+  from column name to position lives in the schema, not in every row.
+</div>
+
+<p>
+The <code>_FileStreamNode</code> wraps this factory in a plan node (inheriting
+from <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" class="source-link" target="_blank" rel="noopener"><code>PlanNode</code></a>) with the same <code>execute()</code> and
+<code>execute_batched()</code> interface that every other node uses. From the
+perspective of the plan tree, it's just another leaf node. Whether the data
+comes from a list in memory, an infinite generator, or a file on disk is
+invisible to the filter, join, and project nodes above it.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  This is how Polars' <code>scan_csv()</code> works. It reads a sample, infers
+  types, and builds a lazy plan — all without loading the file. When you call
+  <code>.collect()</code>, <em>that's</em> when the file streams through the plan.
+  You now know exactly how that works, because the pattern is identical: factory
+  function → plan node → volcano pull.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON D.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Section D.3</span>
+  Constant-Memory Writing
+</h2>
+
+<p>
+Reading was the hard part (type inference, factory closures, file reopening).
+Writing is almost trivially simple — and that's the point. Once you have a
+streaming plan tree, writing to disk is just… consuming the iterator into a
+file instead of a list.
+</p>
+
+<h3>The naive approach: materialize, then write</h3>
+
+<div class="code-label"><span class="dot dot-naive"></span> Collect, then write — defeats the purpose</div>
+<pre><code><span class="cm"># This loads the ENTIRE result into RAM</span>
+<span class="va">result</span> <span class="op">=</span> <span class="va">pipeline</span>.<span class="fn">collect</span>().<span class="fn">to_pylist</span>()
+
+<span class="kw">with</span> <span class="bi">open</span>(<span class="st">"output.csv"</span>, <span class="st">"w"</span>) <span class="kw">as</span> <span class="va">f</span>:
+    <span class="va">writer</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">writer</span>(<span class="va">f</span>)
+    <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">pipeline</span>.<span class="va">columns</span>)
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">result</span>:
+        <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">row</span>.<span class="fn">values</span>())</code></pre>
+
+<div class="aside callout-red">
+  <div class="aside-title">The problem</div>
+  This materializes every row into a Python list before writing any of them. If
+  your pipeline produces 50 million rows, all 50 million sit in memory at once.
+  You built a lazy engine, but calling <code>.collect()</code> before writing
+  throws all that laziness away.
+</div>
+
+<h3>The streaming approach: write from the plan</h3>
+
+<p>
+The fix is obvious once you see it. Don't collect. Don't materialize. Just
+iterate the plan directly and write each batch as it arrives:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Stream from the plan to the file</div>
+<pre><code><span class="kw">def</span> <span class="fn">to_csv_streaming</span>(<span class="va">plan</span>, <span class="va">columns</span>, <span class="va">path</span>):
+    <span class="kw">with</span> <span class="bi">open</span>(<span class="va">path</span>, <span class="st">"w"</span>) <span class="kw">as</span> <span class="va">f</span>:
+        <span class="va">writer</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">writer</span>(<span class="va">f</span>)
+        <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">columns</span>)           <span class="cm"># header</span>
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">plan</span>.<span class="fn">execute_batched</span>():
+            <span class="va">writer</span>.<span class="fn">writerows</span>(<span class="va">chunk</span>)         <span class="cm"># write batch, discard</span></code></pre>
+
+<p>
+That's it. Six lines. The plan tree yields batches of 1,024 rows (via the
+<code>execute_batched()</code> method from Module 3). Each batch is written
+to the file and then dropped. The next batch is pulled from the tree, which
+pulls from its child, which pulls from the leaf node's factory.
+</p>
+
+<p>
+The end-to-end memory profile: one batch of tuples (1,024 rows × however many
+columns). That's a constant. It doesn't matter if the source has 10 thousand
+records or 10 billion.
+</p>
+
+<div class="flow-diagram"><span class="node">Generator</span>  <span class="dim">→ yield →</span>  <span class="node">FilterNode</span>  <span class="dim">→ yield →</span>  <span class="node">ProjectNode</span>  <span class="dim">→ yield →</span>  <span class="node">CSV file</span>
+
+<span class="annotation">Memory at any point: ≈ 1 batch (1,024 rows)</span>
+<span class="annotation">Total rows processed: unlimited</span></div>
+
+<h3>pyfloe's implementation</h3>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's _to_csv_impl (io.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_to_csv_impl</span>(<span class="va">lf</span>, <span class="va">path</span>, <span class="va">delimiter</span><span class="op">=</span><span class="st">","</span>,
+                 <span class="va">header</span><span class="op">=</span><span class="kw">True</span>, <span class="va">encoding</span><span class="op">=</span><span class="st">"utf-8"</span>):
+    <span class="kw">with</span> <span class="bi">open</span>(<span class="va">path</span>, <span class="st">"w"</span>, <span class="va">encoding</span><span class="op">=</span><span class="va">encoding</span>, <span class="va">newline</span><span class="op">=</span><span class="st">""</span>) <span class="kw">as</span> <span class="va">f</span>:
+        <span class="va">writer</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">writer</span>(<span class="va">f</span>, <span class="va">delimiter</span><span class="op">=</span><span class="va">delimiter</span>)
+        <span class="kw">if</span> <span class="va">header</span>:
+            <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">lf</span>.<span class="va">columns</span>)
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">lf</span>.<span class="va">_plan</span>.<span class="fn">execute_batched</span>():
+            <span class="va">writer</span>.<span class="fn">writerows</span>(<span class="va">chunk</span>)</code></pre>
+
+<p>
+Nearly identical to our simplified version. The JSONL writer is equally simple —
+same structure, but each row is serialized as JSON and written as a line.
+</p>
+
+<h3>The demo: stream → enrich → write</h3>
+
+<p>
+Here's the demo's <code>run_stream_to_csv()</code> in action. It reads
+10,000 records from the infinite log generator, filters to 5xx errors, adds
+a computed column, selects the columns it needs, and writes to a CSV — all
+with constant memory:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> From streaming_demo.py</div>
+<pre><code><span class="cl">Stream</span>.<span class="fn">from_iter</span>(
+    <span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">10_000</span>),
+    <span class="va">columns</span><span class="op">=</span>[<span class="st">"ts"</span>, <span class="st">"method"</span>, <span class="st">"path"</span>, <span class="st">"status"</span>,
+             <span class="st">"latency_ms"</span>, <span class="st">"deploy_id"</span>],
+) \
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"status"</span>) <span class="op">&gt;=</span> <span class="nu">500</span>) \
+    .<span class="fn">with_column</span>(<span class="st">"latency_s"</span>, <span class="fn">col</span>(<span class="st">"latency_ms"</span>) <span class="op">/</span> <span class="nu">1000</span>) \
+    .<span class="fn">select</span>(<span class="st">"ts"</span>, <span class="st">"path"</span>, <span class="st">"status"</span>, <span class="st">"latency_s"</span>, <span class="st">"deploy_id"</span>) \
+    .<span class="fn">to_csv</span>(<span class="st">"/tmp/errors.csv"</span>)</code></pre>
+
+<p>
+From generator to disk. The generator yields one record, the filter checks
+the status code, the with_column computes a new value, the select trims the
+columns, and <code>to_csv</code> writes the row. Then the next record.
+At no point does the full dataset exist in memory.
+</p>
+
+<div class="interactive-box">
+  <h4>🧮 Memory calculator: tank vs. tube</h4>
+  <p style="font-family: var(--sans); font-size: 14px; color: var(--text-muted); margin-bottom: 16px;">
+    Pick a file size. See the memory difference between loading everything (eager)
+    and streaming through the plan tree.
+  </p>
+  <div class="btn-row" id="size-buttons">
+    <button class="btn" onclick="calcMemory('100 MB', 100)">100 MB</button>
+    <button class="btn" onclick="calcMemory('1 GB', 1024)">1 GB</button>
+    <button class="btn" onclick="calcMemory('10 GB', 10240)">10 GB</button>
+    <button class="btn" onclick="calcMemory('∞ (infinite)', -1)">∞ Infinite</button>
+  </div>
+  <div class="mem-calc" id="mem-calc" style="display: none;">
+    <div class="mem-result bad">
+      <div class="label">Eager (load all)</div>
+      <div class="value" id="eager-mem">—</div>
+      <div style="font-family: var(--sans); font-size: 12px; color: var(--text-muted); margin-top: 4px;" id="eager-note">
+        O(n) — entire dataset in RAM
+      </div>
+    </div>
+    <div class="mem-result good">
+      <div class="label">Streaming (pyfloe)</div>
+      <div class="value" id="stream-mem">—</div>
+      <div style="font-family: var(--sans); font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+        O(1) — one batch at a time
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function calcMemory(label, sizeMB) {
+  document.getElementById('mem-calc').style.display = 'grid';
+  if (sizeMB === -1) {
+    document.getElementById('eager-mem').textContent = '💀 OOM';
+    document.getElementById('eager-note').textContent = 'Cannot materialize an infinite stream';
+  } else {
+    document.getElementById('eager-mem').textContent = label;
+    document.getElementById('eager-note').textContent = 'O(n) — entire dataset in RAM';
+  }
+  document.getElementById('stream-mem').textContent = '~0.5 MB';
+  document.querySelectorAll('#size-buttons .btn').forEach(function(b) { b.classList.remove('active'); });
+  event.target.classList.add('active');
+}
+</script>
+
+<div class="aside callout-teal">
+  <div class="aside-title">In the wild</div>
+  Polars calls this <code>.sink_csv()</code>. Spark calls it writing to a
+  "streaming sink." Different names, same mechanism:
+  pull from the plan tree, write to the output, discard each batch.
+  There's no secret sauce — it's a <code>for</code> loop over an iterator
+  connected to a file writer. <strong>A tube, not a tank.</strong>
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON D.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Section D.4</span>
+  The Stream Pipeline — Skipping the Tree
+</h2>
+
+<p>
+Everything we've covered so far uses the <em>same plan tree</em> you built in
+Modules 3–5. <code>from_iter()</code> returns a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> backed
+by <code>IteratorSourceNode</code> → <code>FilterNode</code> →
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a> → etc. The volcano model pulls rows through the tree.
+It works, it's elegant, and it streams with constant memory.
+</p>
+
+<p>
+But our demo has a natural place to see both models side by side. The error
+summary needs joins and aggregation — it <em>must</em> use <code>LazyFrame</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> LazyFrame pipeline — needs the full plan tree</div>
+<pre><code><span class="va">error_summary</span> <span class="op">=</span> (
+    <span class="fn">from_iter</span>(<span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">10_000</span>))
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"status"</span>) <span class="op">&gt;=</span> <span class="nu">500</span>)
+    .<span class="fn">with_column</span>(<span class="st">"latency_s"</span>, <span class="fn">col</span>(<span class="st">"latency_ms"</span>) <span class="op">/</span> <span class="nu">1000</span>)
+    .<span class="fn">join</span>(<span class="va">deploys</span>, <span class="va">on</span><span class="op">=</span><span class="st">"deploy_id"</span>)       <span class="cm"># ← needs hash join</span>
+    .<span class="fn">group_by</span>(<span class="st">"path"</span>, <span class="st">"deployer"</span>)
+    .<span class="fn">agg</span>(
+        <span class="fn">col</span>(<span class="st">"latency_s"</span>).<span class="fn">mean</span>().<span class="fn">alias</span>(<span class="st">"avg_latency"</span>),
+        <span class="fn">col</span>(<span class="st">"status"</span>).<span class="fn">count</span>().<span class="fn">alias</span>(<span class="st">"error_count"</span>),
+    )
+)</code></pre>
+
+<p>
+But the simple filter-and-write-to-CSV part — no joins, no aggregation —
+doesn't need the tree at all. And the tree has a cost.
+</p>
+
+<h3>The overhead of trees</h3>
+
+<p>
+Every row that passes through a <code>FilterNode</code> triggers a method call:
+<code>execute_batched()</code> on the child, then <code>predicate.eval(row, col_map)</code>
+on the expression. For a <code>ProjectNode</code>, there's another method call
+and another expression evaluation. Each plan node adds a layer of generator
+orchestration per row.
+</p>
+
+<p>
+For complex plans with joins and aggregations, this overhead is negligible
+compared to the actual work. But for simple, purely streaming pipelines — read,
+filter, add a column, write — the tree traversal overhead dominates.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The cost of indirection</div>
+  A pipeline like <code>filter → with_column → select → to_csv</code>
+  passes each row through three plan nodes. Each node calls <code>execute_batched()</code>
+  on its child — that's three layers of Python generator frames per batch. When your
+  work per row is tiny, the overhead of the tree itself becomes the bottleneck.
+</div>
+
+<h3>The flat loop</h3>
+
+<p>
+pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> class offers an alternative. Instead of building
+a tree of plan nodes, it records transforms as a <strong>flat list of steps</strong>
+and executes them in a single tight loop. No tree traversal, no nested
+generators.
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> How Stream records transforms</div>
+<pre><code><span class="cm"># Each method appends to self._transforms — no nodes created</span>
+<span class="va">stream</span> <span class="op">=</span> <span class="cl">Stream</span>.<span class="fn">from_iter</span>(<span class="va">source</span>, <span class="va">columns</span><span class="op">=</span>[...])
+<span class="va">stream</span> <span class="op">=</span> <span class="va">stream</span>.<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"status"</span>) <span class="op">&gt;=</span> <span class="nu">500</span>)
+<span class="va">stream</span> <span class="op">=</span> <span class="va">stream</span>.<span class="fn">with_column</span>(<span class="st">"latency_s"</span>, <span class="fn">col</span>(<span class="st">"latency_ms"</span>) <span class="op">/</span> <span class="nu">1000</span>)
+<span class="va">stream</span> <span class="op">=</span> <span class="va">stream</span>.<span class="fn">select</span>(<span class="st">"ts"</span>, <span class="st">"path"</span>, <span class="st">"status"</span>, <span class="st">"latency_s"</span>)
+
+<span class="cm"># Internally, _transforms is:</span>
+<span class="cm"># [</span>
+<span class="cm">#   ("filter",      &lt;Expr: col("status") >= 500&gt;),</span>
+<span class="cm">#   ("with_column", "latency_s", &lt;Expr: col("latency_ms") / 1000&gt;),</span>
+<span class="cm">#   ("select",      ["ts", "path", "status", "latency_s"]),</span>
+<span class="cm"># ]</span></code></pre>
+
+<p>
+No nodes. No tree. Just a list of what to do. When it's time to execute,
+<code>_build_processor()</code> compiles this into a sequence of steps — each
+one a tuple with the operation kind, the pre-compiled expression or index list,
+and a frozen column map. Then <code>_execute()</code> runs a single loop:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's Stream._execute() (stream.py, simplified)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_execute</span>(<span class="va">self</span>):
+    <span class="va">steps</span>, <span class="va">_</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_build_processor</span>()
+
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.<span class="va">_source_factory</span>():    <span class="cm"># one loop over the source</span>
+        <span class="va">skip</span> <span class="op">=</span> <span class="kw">False</span>
+        <span class="va">current</span> <span class="op">=</span> <span class="va">row</span>
+
+        <span class="kw">for</span> <span class="va">step</span> <span class="kw">in</span> <span class="va">steps</span>:               <span class="cm"># flat step list</span>
+            <span class="va">kind</span> <span class="op">=</span> <span class="va">step</span>[<span class="nu">0</span>]
+            <span class="kw">if</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"filter"</span>:
+                <span class="kw">if</span> <span class="kw">not</span> <span class="va">step</span>[<span class="nu">1</span>].<span class="fn">eval</span>(<span class="va">current</span>, <span class="va">step</span>[<span class="nu">2</span>]):
+                    <span class="va">skip</span> <span class="op">=</span> <span class="kw">True</span>
+                    <span class="kw">break</span>
+            <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"with_column"</span>:
+                <span class="va">current</span> <span class="op">=</span> <span class="va">current</span> <span class="op">+</span> (<span class="va">step</span>[<span class="nu">1</span>].<span class="fn">eval</span>(<span class="va">current</span>, <span class="va">step</span>[<span class="nu">2</span>]),)
+            <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"select"</span>:
+                <span class="va">current</span> <span class="op">=</span> <span class="bi">tuple</span>(<span class="va">current</span>[<span class="va">i</span>] <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="va">step</span>[<span class="nu">1</span>])
+
+        <span class="kw">if</span> <span class="kw">not</span> <span class="va">skip</span>:
+            <span class="kw">yield</span> <span class="va">current</span></code></pre>
+
+<p>
+One outer loop over the source. One inner loop over the steps. No method
+dispatch, no generator chaining, no tree traversal.
+</p>
+
+<h3>Visualizing the difference</h3>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="dot dot-naive" style="width:9px; height:9px;"></span> LazyFrame (volcano tree)</h4>
+    <div class="card-body" style="font-family: var(--mono); font-size: 12.5px; line-height: 1.8;">
+      ProjectNode.execute_batched()<br>
+      &nbsp;&nbsp;→ FilterNode.execute_batched()<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;→ IteratorSourceNode.execute_batched()<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ factory()<br>
+      <br>
+      <span style="color: var(--text-muted); font-family: var(--sans); font-size: 11px;">
+        3 generator frames per batch
+      </span>
+    </div>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="dot dot-better" style="width:9px; height:9px;"></span> Stream (flat loop)</h4>
+    <div class="card-body" style="font-family: var(--mono); font-size: 12.5px; line-height: 1.8;">
+      for row in factory():<br>
+      &nbsp;&nbsp;step 1: filter<br>
+      &nbsp;&nbsp;step 2: with_column<br>
+      &nbsp;&nbsp;step 3: select<br>
+      &nbsp;&nbsp;yield row<br>
+      <span style="color: var(--text-muted); font-family: var(--sans); font-size: 11px;">
+        1 generator frame total
+      </span>
+    </div>
+  </div>
+</div>
+
+<h3>Measuring the difference</h3>
+
+<p>
+The demo includes a timing comparison — same filter + transform pipeline,
+50,000 records, measured with <code>time.perf_counter()</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> From streaming_demo.py — run_timing_comparison()</div>
+<pre><code><span class="cm"># LazyFrame (volcano tree)</span>
+<span class="va">t0</span> <span class="op">=</span> <span class="va">time</span>.<span class="fn">perf_counter</span>()
+<span class="va">result_lf</span> <span class="op">=</span> (
+    <span class="fn">from_iter</span>(<span class="kw">lambda</span>: <span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">50_000</span>))
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"status"</span>) <span class="op">&gt;=</span> <span class="nu">500</span>)
+    .<span class="fn">with_column</span>(<span class="st">"latency_s"</span>, <span class="fn">col</span>(<span class="st">"latency_ms"</span>) <span class="op">/</span> <span class="nu">1000</span>)
+    .<span class="fn">select</span>(<span class="st">"ts"</span>, <span class="st">"path"</span>, <span class="st">"status"</span>, <span class="st">"latency_s"</span>)
+    .<span class="fn">to_pylist</span>()
+)
+<span class="va">t_lf</span> <span class="op">=</span> <span class="va">time</span>.<span class="fn">perf_counter</span>() <span class="op">-</span> <span class="va">t0</span>
+
+<span class="cm"># Stream (flat loop)</span>
+<span class="va">t0</span> <span class="op">=</span> <span class="va">time</span>.<span class="fn">perf_counter</span>()
+<span class="va">result_st</span> <span class="op">=</span> (
+    <span class="cl">Stream</span>.<span class="fn">from_iter</span>(
+        <span class="fn">http_log_stream</span>(<span class="va">limit</span><span class="op">=</span><span class="nu">50_000</span>),
+        <span class="va">columns</span><span class="op">=</span>[<span class="st">"ts"</span>, <span class="st">"method"</span>, <span class="st">"path"</span>,
+                 <span class="st">"status"</span>, <span class="st">"latency_ms"</span>, <span class="st">"deploy_id"</span>],
+    )
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"status"</span>) <span class="op">&gt;=</span> <span class="nu">500</span>)
+    .<span class="fn">with_column</span>(<span class="st">"latency_s"</span>, <span class="fn">col</span>(<span class="st">"latency_ms"</span>) <span class="op">/</span> <span class="nu">1000</span>)
+    .<span class="fn">select</span>(<span class="st">"ts"</span>, <span class="st">"path"</span>, <span class="st">"status"</span>, <span class="st">"latency_s"</span>)
+    .<span class="fn">to_pylist</span>()
+)
+<span class="va">t_st</span> <span class="op">=</span> <span class="va">time</span>.<span class="fn">perf_counter</span>() <span class="op">-</span> <span class="va">t0</span></code></pre>
+
+<p>
+Run it yourself — the <code>Stream</code> version is typically <strong>20–40%
+faster</strong> for this kind of simple pipeline. The gap widens with more
+plan nodes (more generator frames to avoid) and narrows when per-row work
+is heavier (the overhead becomes a smaller fraction of total time).
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Why this is faster</div>
+  Python's generator protocol has real overhead: frame creation, suspension,
+  resumption. Each <code>yield</code>/<code>next()</code> pair across a node
+  boundary costs function-call overhead. The flat loop avoids all of that. The
+  tradeoff: <code>Stream</code> can't do joins, aggregations, sorts, or
+  optimization. It's only for filter → transform → write.
+</div>
+
+<h3>The <code>foreach</code> callback — a live dashboard</h3>
+
+<p>
+The demo's most Kafka-like feature is the rolling dashboard. It uses
+<code>Stream.foreach()</code> to process each record with a callback,
+maintaining manual accumulators just like the hash aggregation from Module 4:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> From streaming_demo.py — run_live_dashboard()</div>
+<pre><code><span class="va">stats</span> <span class="op">=</span> <span class="fn">defaultdict</span>(<span class="kw">lambda</span>: {<span class="st">"count"</span>: <span class="nu">0</span>, <span class="st">"error_count"</span>: <span class="nu">0</span>, ...})
+
+<span class="kw">def</span> <span class="fn">process</span>(<span class="va">row</span>):
+    <span class="va">stats</span>[<span class="va">row</span>[<span class="st">"path"</span>]][<span class="st">"count"</span>] <span class="op">+=</span> <span class="nu">1</span>
+    <span class="kw">if</span> <span class="va">row</span>[<span class="st">"status"</span>] <span class="op">&gt;=</span> <span class="nu">500</span>:
+        <span class="va">stats</span>[<span class="va">row</span>[<span class="st">"path"</span>]][<span class="st">"error_count"</span>] <span class="op">+=</span> <span class="nu">1</span>
+        <span class="cm"># ... update accumulators ...</span>
+    <span class="kw">if</span> <span class="va">total</span>[<span class="st">"n"</span>] <span class="op">%</span> <span class="nu">1000</span> <span class="op">==</span> <span class="nu">0</span>:
+        <span class="fn">print_dashboard</span>()  <span class="cm"># rolling summary every 1,000 records</span>
+
+<span class="cl">Stream</span>.<span class="fn">from_iter</span>(<span class="va">source</span>, <span class="va">columns</span><span class="op">=</span>[...]).<span class="fn">foreach</span>(<span class="va">process</span>)</code></pre>
+
+<p>
+The <code>defaultdict</code> accumulator is exactly the hash aggregation
+pattern from Module 4 — running sum, running count, running max — just done
+manually because <code>Stream</code> doesn't have <code>group_by</code>. But
+the student should recognize it: it's the same algorithm, different container.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">The production version</div>
+  Spark calls this concept "whole-stage code generation" — instead of
+  interpreting the plan tree node by node, it compiles the plan into a single
+  tight loop (in JVM bytecode). Flink's operator chaining does the same.
+  pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> uses a Python list of tuples instead of bytecode,
+  but the insight is identical: <strong>when per-row work is tiny, the overhead
+  of indirection matters more than the work itself.</strong>
+</div>
+
+<h3>When to use which</h3>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4>Use <code>LazyFrame</code> when…</h4>
+    <p>
+      You need joins, aggregations, sorts, window functions, or query
+      optimization. This is the general-purpose engine — it handles anything.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4>Use <code>Stream</code> when…</h4>
+    <p>
+      You have a simple pipeline — read, filter, transform, write — and want
+      maximum throughput with constant memory. No joins, no group-by, no
+      optimizer. Just speed.
+    </p>
+  </div>
+</div>
+
+<p>
+The demo uses both: <code>LazyFrame</code> for the enriched error summary
+(it needs a hash join against the <code>deploys</code> table and a
+<code>group_by</code>), and <code>Stream</code> for the CSV export and the
+live dashboard (pure filter → transform → write). That split is natural — it
+falls directly out of what each execution model supports.
+</p>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2 id="exercises">
+  <span class="lesson-num">Exercises</span>
+  Test Your Understanding
+</h2>
+
+<div class="interactive-box">
+  <h4>Question 1: Why a factory?</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    Why does <code>IteratorSourceNode</code> store a callable factory instead
+    of a generator?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="checkAnswer(1, this, false)">Generators are slow</button>
+    <button class="btn" onclick="checkAnswer(1, this, false)">Factories use less memory</button>
+    <button class="btn" onclick="checkAnswer(1, this, true)">Generators are single-pass</button>
+    <button class="btn" onclick="checkAnswer(1, this, false)">Python requires it</button>
+  </div>
+  <div class="output-box" id="answer-1" style="display: none;"></div>
+</div>
+
+<div class="interactive-box">
+  <h4>Question 2: Memory profile</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    For <code>from_iter(http_log_stream(limit=10_000_000)).filter(...).to_csv("out.csv")</code>,
+    how much memory does the pipeline use at peak?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="checkAnswer(2, this, false)">Proportional to 10M rows</button>
+    <button class="btn" onclick="checkAnswer(2, this, false)">Proportional to filtered rows</button>
+    <button class="btn" onclick="checkAnswer(2, this, true)">~1 batch (≈ 0.5 MB)</button>
+    <button class="btn" onclick="checkAnswer(2, this, false)">Depends on filter selectivity</button>
+  </div>
+  <div class="output-box" id="answer-2" style="display: none;"></div>
+</div>
+
+<div class="interactive-box">
+  <h4>Question 3: Stream vs. LazyFrame</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    The demo uses <code>LazyFrame</code> for the error summary but <code>Stream</code> for the CSV export. Why can't the error summary use <code>Stream</code>?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="checkAnswer(3, this, false)">Stream doesn't support filter()</button>
+    <button class="btn" onclick="checkAnswer(3, this, true)">Stream doesn't support join or group_by</button>
+    <button class="btn" onclick="checkAnswer(3, this, false)">Stream is slower for large data</button>
+    <button class="btn" onclick="checkAnswer(3, this, false)">Stream can't read from generators</button>
+  </div>
+  <div class="output-box" id="answer-3" style="display: none;"></div>
+</div>
+
+<div class="interactive-box">
+  <h4>Question 4: Type inference tradeoff</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    pyfloe infers CSV column types from a sample of 100 rows. What happens if
+    row 101 contains a string in a column that was inferred as <code>int</code>?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="checkAnswer(4, this, false)">Schema updates automatically</button>
+    <button class="btn" onclick="checkAnswer(4, this, true)">Cast error at execution time</button>
+    <button class="btn" onclick="checkAnswer(4, this, false)">The row is silently skipped</button>
+    <button class="btn" onclick="checkAnswer(4, this, false)">Column reverts to str</button>
+  </div>
+  <div class="output-box" id="answer-4" style="display: none;"></div>
+</div>
+
+<div class="interactive-box">
+  <h4>Question 5: The live dashboard</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    The demo's <code>run_live_dashboard()</code> uses <code>Stream.foreach()</code>
+    with a <code>defaultdict</code> accumulator. Which pattern from an earlier
+    module is this most similar to?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="checkAnswer(5, this, false)">Expression AST evaluation</button>
+    <button class="btn" onclick="checkAnswer(5, this, false)">Filter pushdown</button>
+    <button class="btn" onclick="checkAnswer(5, this, true)">Hash aggregation (Module 4)</button>
+    <button class="btn" onclick="checkAnswer(5, this, false)">Column pruning</button>
+  </div>
+  <div class="output-box" id="answer-5" style="display: none;"></div>
+</div>
+
+<script>
+var explanations = {
+  1: ["Correct! Generators are single-pass — once exhausted, they yield nothing. A factory creates a fresh generator each time, enabling repeatable reads. That's why from_iter(lambda: http_log_stream(limit=100)) works twice while from_iter(http_log_stream(limit=100)) doesn't.",
+      "Not quite. Generators aren't inherently slower or more memory-hungry. The issue is that they're single-pass — once consumed, they're empty forever. A factory lets you create a new generator each time execute() is called."],
+  2: ["Correct! The pipeline streams row by row. The factory yields records, the filter passes or drops each one, and to_csv writes each batch. Only one batch (~1,024 rows ≈ 0.5 MB) is in memory at any time, regardless of how many rows the source produces.",
+      "Not quite. Because to_csv streams directly from the plan tree, the full dataset is never materialized. Only one batch of ~1,024 rows lives in memory at any time — whether it's 10 million or 10 billion rows."],
+  3: ["Correct! Stream only supports filter, with_column, select, and apply — operations that process one row at a time. The error summary needs .join(deploys) (which requires a hash table) and .group_by().agg() (which requires accumulators across all rows). These need the full plan tree with JoinNode and AggNode.",
+      "Not quite. Stream does support filter() — and with_column() and select() too. What it can't do is join (needs a hash table) or group_by().agg() (needs to accumulate across rows). Those require the full LazyFrame plan tree."],
+  4: ["Correct! Schema inference happens once on 100 rows. If later rows don't match the inferred types, _cast_value will fail at execution time. This is the fundamental tradeoff of sample-based inference — you gain O(1) memory but trade away guaranteed type safety across the whole file. Polars makes the same bet.",
+      "Not quite. The schema is fixed after sampling — it doesn't update dynamically. If a later row doesn't match, the cast will fail at execution time. That's the inherent tradeoff of streaming type inference."],
+  5: ["Correct! The defaultdict accumulator in the dashboard is exactly the hash aggregation pattern from Module 4 — keyed by endpoint, maintaining running sums, counts, and maxes. The only difference is that here you're writing it by hand because Stream doesn't have group_by. It's the same algorithm: O(k) memory where k = number of unique keys.",
+      "Not quite. The defaultdict accumulator — keyed by endpoint, tracking running count, sum, and max — is the hash aggregation pattern from Module 4. There, AggNode did it automatically; here, you do it manually in the foreach callback. Same algorithm, different wrapper."]
+};
+
+function checkAnswer(q, btn, correct) {
+  var box = document.getElementById('answer-' + q);
+  box.style.display = 'block';
+  var idx = correct ? 0 : 1;
+  box.textContent = explanations[q][idx];
+  box.className = correct ? 'output-box' : 'output-box error';
+
+  btn.parentNode.querySelectorAll('.btn').forEach(function(b) {
+    b.style.opacity = '0.5';
+    b.style.pointerEvents = 'none';
+  });
+  btn.style.opacity = '1';
+  if (correct) {
+    btn.style.borderColor = 'var(--teal)';
+    btn.style.color = 'var(--teal)';
+  } else {
+    btn.style.borderColor = 'var(--coral)';
+    btn.style.color = 'var(--coral)';
+  }
+}
+</script>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- CLOSING -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">Recap</span>
+  What You Now Know
+</h2>
+
+<p>
+Let's be honest about what just happened. This deep dive introduced
+<em>one</em> new pattern — the iterator factory — and spent the rest of its
+time showing you that the streaming I/O system is just your existing knowledge
+applied to files and infinite sources. The generator-based volcano model you
+built in Module 1? That <em>is</em> streaming. The batched execution from
+Module 3? That drives the writers. The hash aggregation from Module 4? That
+powers the live dashboard's accumulators.
+</p>
+
+<p>
+<strong>The factory pattern</strong> — store a callable that creates a fresh
+iterator, not the iterator itself. This makes streaming sources repeatable.
+<code>from_iter(lambda: source)</code> instead of <code>from_iter(source)</code>.
+</p>
+
+<p>
+<strong>Constant-memory reading</strong> — sample 100 rows for type inference,
+then yield the rest one at a time through a factory. The schema is known
+instantly; the data streams on demand.
+</p>
+
+<p>
+<strong>Constant-memory writing</strong> — iterate the plan tree directly into
+a file writer. No materialization, no intermediate storage. A tube, not a tank.
+</p>
+
+<p>
+<strong>The <code>Stream</code> class</strong> — when the plan tree's overhead
+is the bottleneck, compile transforms into a flat loop. Same semantics,
+fewer function calls, ~30% faster for simple pipelines. Use it for filter →
+transform → write. Use <code>LazyFrame</code> for everything else.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">What we didn't cover</div>
+  pyfloe also supports <code>from_chunks()</code> for paginated API sources
+  (each page yields a batch of rows), <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_jsonl" class="source-link" target="_blank" rel="noopener"><code>read_jsonl()</code></a> for JSON Lines,
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_parquet" class="source-link" target="_blank" rel="noopener"><code>read_parquet()</code></a> via PyArrow, and <code>Stream.from_csv()</code>
+  for direct CSV-to-Stream. They all follow the same factory pattern. If you
+  understand <code>read_csv</code> and <code>Stream.from_iter</code>, you
+  understand them all — the format parsing differs, the architecture is identical.
+</div>
+
+<p>
+The next time someone at a conference talks about "streaming architecture" like
+it's astrophysics, you'll know the core: it's a generator, a factory, and a
+<code>for</code> loop. Distributed streaming adds real complexity (fault
+tolerance, backpressure, exactly-once delivery), but the fundamental mechanism
+is what you've already built.
+</p>
+
+<div class="source-references">
+  <h3>Source References</h3>
+  <p>Browse the pyfloe source code for the classes and functions covered in this deep dive.</p>
+  <div class="ref-group">
+    <h4>plan.py — Plan Nodes</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" target="_blank" rel="noopener"><code>PlanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+    </ul>
+  </div>
+  <div class="ref-group">
+    <h4>core.py — LazyFrame API</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener"><code>LazyFrame</code></a></li>
+    </ul>
+  </div>
+  <div class="ref-group">
+    <h4>stream.py — Streaming</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" target="_blank" rel="noopener"><code>Stream</code></a></li>
+    </ul>
+  </div>
+  <div class="ref-group">
+    <h4>io.py — File I/O</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_csv" target="_blank" rel="noopener"><code>read_csv()</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_jsonl" target="_blank" rel="noopener"><code>read_jsonl()</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_parquet" target="_blank" rel="noopener"><code>read_parquet()</code></a></li>
+    </ul>
+  </div>
+</div>

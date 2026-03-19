@@ -1,0 +1,547 @@
+<h1>Meet <em>pyfloe</em></h1>
+
+<p class="subtitle">
+A zero-dependency, lazy dataframe engine written in pure Python — and
+the reason this course can exist at all.
+</p>
+
+<p>
+Most courses that teach you "how libraries work" resort to toy examples.
+They build a 50-line class, wave their hands, and say "real libraries
+do something like this, but more complicated." You walk away feeling like
+you learned something, but you couldn't actually point to a line of
+production code and say <em>"I understand why that's there."</em>
+</p>
+
+<p>
+This course is different. We have a real library — a working, published,
+pip-installable dataframe engine — and we're going to take it apart
+until there's nothing left that feels like magic.
+</p>
+
+<p>
+That library is <strong>pyfloe</strong>.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: What is pyfloe? -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">The Library</span>
+  What Is pyfloe?
+</h2>
+
+<p>
+pyfloe is a lazy dataframe library written entirely in pure Python.
+No C extensions. No Cython. No Rust bindings. No dependencies at all —
+not even NumPy. Install it with <code>pip install pyfloe</code> and you get
+the whole thing: expression API, query optimizer, window functions, streaming
+I/O, and type safety.
+</p>
+
+<p>
+Here's what it looks like to use:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> A real pyfloe pipeline</div>
+<pre><code><span class="kw">import</span> pyfloe <span class="kw">as</span> pf
+
+<span class="va">result</span> <span class="op">=</span> (
+    pf.read_csv(<span class="st">"orders.csv"</span>)                             <span class="cm"># lazy — file not read yet</span>
+    .filter(pf.col(<span class="st">"amount"</span>) <span class="op">&gt;</span> <span class="nu">100</span>)                    <span class="cm"># lazy — no rows scanned</span>
+    .with_column(<span class="st">"rank"</span>, pf.row_number()
+        .over(partition_by<span class="op">=</span><span class="st">"region"</span>, order_by<span class="op">=</span><span class="st">"amount"</span>))
+    .select(<span class="st">"order_id"</span>, <span class="st">"region"</span>, <span class="st">"amount"</span>, <span class="st">"rank"</span>)
+    .sort(<span class="st">"region"</span>, <span class="st">"rank"</span>)
+    .collect()                                        <span class="cm"># NOW it runs</span>
+)</code></pre>
+
+<p>
+If you've used Polars or PySpark, this should look familiar.
+pyfloe implements the same architectural ideas — lazy evaluation, expression
+trees, a volcano execution model, query optimization — but in a codebase small
+enough that you can read every line in an afternoon.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">Show the magic</div>
+  That <code>pf.col("amount") &gt; 100</code> expression doesn't compare anything
+  when you write it. It builds an <em>expression object</em> — a tiny tree
+  node that says "compare column 'amount' to the value 100." The
+  <code>.filter()</code> call doesn't scan any rows either — it creates a
+  <em>plan node</em> that wraps the expression. Nothing executes until
+  <code>.collect()</code>. This is exactly how Polars works, and by the end
+  of this course, you'll have built every piece of this pipeline yourself.
+</div>
+
+<h3>See it for yourself</h3>
+
+<p>
+Before we run a full pipeline, try something smaller. Hit Run and look
+at what <code>pf.col("price") > 100</code> actually returns:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Live — what does col("price") > 100 return?</div>
+<pre data-executable data-expanded data-label="Try it — what's the type?"><code>import pyfloe as pf
+
+expr = pf.col("price") > 100
+
+# Not True. Not False. It's an expression object.
+print(type(expr))
+print(repr(expr))
+
+# It knows which columns it needs:
+print(f"Columns used: {expr.required_columns()}")</code></pre>
+
+<p>
+That's the core insight: <code>></code> didn't compare anything. It built
+an object that <em>describes</em> the comparison. The engine can inspect it,
+optimize around it, and evaluate it later. Now let's see a full pipeline:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Live — editable pyfloe pipeline</div>
+<pre data-executable data-expanded data-label="A full pyfloe pipeline"><code>import pyfloe as pf
+
+# Create some data inline
+orders = pf.LazyFrame([
+    {"order_id": 1, "region": "EU",   "amount": 250.0},
+    {"order_id": 2, "region": "US",   "amount": 45.0},
+    {"order_id": 3, "region": "EU",   "amount": 180.0},
+    {"order_id": 4, "region": "US",   "amount": 320.0},
+    {"order_id": 5, "region": "APAC", "amount": 90.0},
+    {"order_id": 6, "region": "US",   "amount": 150.0},
+])
+
+# Build a lazy pipeline — nothing runs yet
+result = (
+    orders
+    .filter(pf.col("amount") > 100)
+    .select("order_id", "region", "amount")
+    .sort("region", "amount")
+    .collect()
+)
+
+# Print the results
+for row in result.to_pylist():
+    print(row)</code></pre>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: Why pyfloe? -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">The Teaching Vehicle</span>
+  Why pyfloe?
+</h2>
+
+<p>
+We could have tried to reverse-engineer Polars itself, or PySpark, or DuckDB.
+But those libraries have a problem as teaching material: they're <em>enormous</em>.
+Polars is hundreds of thousands of lines of Rust. PySpark delegates to a JVM.
+DuckDB is C++. You can read their documentation, but you can't read their
+source code and come away understanding the full picture.
+</p>
+
+<p>
+pyfloe was purpose-built to solve this problem. It implements the
+<span class="highlight">core architectural patterns</span> of the big libraries,
+but in pure Python, at a scale where every design decision is visible:
+</p>
+
+<div class="feature-grid">
+  <div class="feature-card">
+    <h4>Pure Python</h4>
+    <p>
+      No compiled extensions. Every algorithm — hash joins, expression
+      evaluation, query optimization — is written in Python you can step
+      through in a debugger.
+    </p>
+  </div>
+  <div class="feature-card">
+    <h4>Zero Dependencies</h4>
+    <p>
+      The entire library is self-contained. There's no layer of abstraction
+      hiding behind a <code>numpy</code> or <code>pyarrow</code> import.
+      What you see is what runs.
+    </p>
+  </div>
+  <div class="feature-card">
+    <h4>Small Enough to Read</h4>
+    <p>
+      The entire engine fits in six files. Small enough to read end-to-end,
+      large enough to be real — it has streaming I/O, window functions,
+      and a rule-based optimizer.
+    </p>
+  </div>
+  <div class="feature-card">
+    <h4>Real Architecture</h4>
+    <p>
+      Expression ASTs, the Volcano model, hash aggregation, filter pushdown,
+      column pruning — the same patterns that power Polars, Spark, and
+      every serious query engine.
+    </p>
+  </div>
+</div>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Important caveat</div>
+  pyfloe is not trying to compete with Polars on performance. It can't —
+  Python is orders of magnitude slower than Rust for number-crunching. But
+  performance isn't the point. The point is that the <em>architecture</em>
+  is identical. When you understand how pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> pulls
+  rows from a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> through a generator chain, you understand
+  how Polars does the same thing with Rust iterators. The concepts transfer
+  directly.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: The Architecture -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">The Blueprint</span>
+  Six Files, One Engine
+</h2>
+
+<p>
+pyfloe's entire codebase fits in six files. Each one is responsible for a
+distinct layer of the engine, and together they form the full pipeline from
+"read a CSV" to "return optimized results." Here's the lay of the land:
+</p>
+
+<div class="arch-box">
+  <div class="arch-file">
+    <span class="arch-name">schema.py</span>
+    <span class="arch-desc">Type propagation — every node knows its output types <em>before</em> any data flows</span>
+  </div>
+  <div class="arch-file">
+    <span class="arch-name">expr.py</span>
+    <span class="arch-desc">The expression AST — <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" class="source-link" target="_blank" rel="noopener"><code>col</code></a>, <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" class="source-link" target="_blank" rel="noopener"><code>lit</code></a>, <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20when" class="source-link" target="_blank" rel="noopener"><code>when</code></a>, arithmetic, comparisons, aggregations, windows</span>
+  </div>
+  <div class="arch-file">
+    <span class="arch-name">plan.py</span>
+    <span class="arch-desc">Plan nodes + the query optimizer — the volcano execution model, filter pushdown, column pruning</span>
+  </div>
+  <div class="arch-file">
+    <span class="arch-name">core.py</span>
+    <span class="arch-desc">The <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> class — the public API that wraps plan nodes into a fluent interface</span>
+  </div>
+  <div class="arch-file">
+    <span class="arch-name">io.py</span>
+    <span class="arch-desc">File readers and writers — CSV, TSV, JSONL, JSON, fixed-width, with streaming and type inference</span>
+  </div>
+  <div class="arch-file">
+    <span class="arch-name">stream.py</span>
+    <span class="arch-desc">Streaming pipelines — <code>from_iter</code>, <code>from_chunks</code>, and the <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> class</span>
+  </div>
+
+</div>
+
+<p>
+You don't need to memorize this. Over the course of five modules, we'll
+build simplified versions of each layer ourselves, then compare our
+code to the real pyfloe source. By the end, every file in this diagram
+will feel like something you could have written yourself.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: Two Trees -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">The Core Idea</span>
+  Two Trees Working Together
+</h2>
+
+<p>
+If there is one architectural insight that makes everything in pyfloe (and
+Polars, and Spark) click, it's this: the engine is built around
+<strong>two distinct tree structures</strong> that work together.
+</p>
+
+<h3>Tree 1: The Plan Tree</h3>
+
+<p>
+The plan tree describes <em>how data flows</em>. Each node is an operation —
+scan a file, filter rows, join two tables, project columns. The nodes
+form a tree because operations are nested: a <code>FilterNode</code> pulls
+from a <code>ScanNode</code>, a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a> pulls from two children,
+and so on. When you call <code>.collect()</code>, the engine walks this tree
+from the top and pulls data upward through every node.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> A plan tree in pseudocode</div>
+<pre><code><span class="cl">ProjectNode</span>(<span class="st">"order_id"</span>, <span class="st">"amount"</span>)           <span class="cm"># ← collect() starts here</span>
+  └── <span class="cl">FilterNode</span>(amount <span class="op">&gt;</span> <span class="nu">100</span>)                <span class="cm"># pulls from ↓</span>
+        └── <span class="cl">ScanNode</span>(<span class="st">"orders.csv"</span>)             <span class="cm"># reads the file</span></code></pre>
+
+<h3>Tree 2: The Expression Tree</h3>
+
+<p>
+The expression tree describes <em>what to compute</em> on each row. When
+you write <code>pf.col("amount") > 100</code>, that's not a comparison — it's
+a tree of objects: a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> with a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col("amount")</code></a>
+on the left, a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit(100)</code></a> on the right, and the <code>&gt;</code>
+operator connecting them.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> An expression tree for pf.col("amount") > 100</div>
+<pre><code><span class="cl">BinaryExpr</span>(op<span class="op">=</span><span class="st">"&gt;"</span>)
+  ├── left:  <span class="cl">Col</span>(<span class="st">"amount"</span>)
+  └── right: <span class="cl">Lit</span>(<span class="nu">100</span>)</code></pre>
+
+<p>
+Expressions live <em>inside</em> plan nodes. The <code>FilterNode</code>
+above doesn't hold a lambda — it holds that expression tree. This is the
+key architectural decision that makes everything else possible: because
+the expression is data (not a black-box function), the engine can
+<em>inspect</em> it, figure out which columns it needs, and make smart
+optimization decisions.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The two trees converge</div>
+  These two trees appear separately at first. We'll build expressions in
+  Module 2, and plan nodes in Modules 1 and 3. But they come together in
+  Module 3 (when expressions are plugged into plan nodes) and fully converge
+  in Module 5 (the Optimizer), where the engine walks the plan tree and
+  inspects the expression trees inside each node to decide how to rewrite
+  the plan. Keep these two structures in mind — they are the skeleton of the
+  entire engine.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: The Journey Ahead -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">The Roadmap</span>
+  What We'll Build
+</h2>
+
+<p>
+The course follows pyfloe's architecture from the bottom up. Each module
+builds a new layer, and each layer depends on the one before it. Here's
+the journey:
+</p>
+
+<div class="module-map">
+  <div class="map-item">
+    <div class="map-num">1</div>
+    <div>
+      <div class="map-title">The Context &amp; Foundation</div>
+      <div class="map-desc">
+        Why DataFrames exist. Eager vs. lazy execution. Generators and the
+        volcano model. Why lambdas are a dead end for optimization.
+      </div>
+    </div>
+  </div>
+  <div class="map-item">
+    <div class="map-num">2</div>
+    <div>
+      <div class="map-title">Python Magic — Dunder Methods &amp; the Expression AST</div>
+      <div class="map-desc">
+        Hijacking Python's operators so <code>pf.col("x") + pf.col("y")</code> builds
+        an inspectable tree instead of running a computation. <code>Col</code>,
+        <code>Lit</code>, <code>BinaryExpr</code>, <code>WhenExpr</code>.
+      </div>
+      <div class="map-files">→ expr.py</div>
+    </div>
+  </div>
+  <div class="map-item">
+    <div class="map-num">3</div>
+    <div>
+      <div class="map-title">The Engine Room — Plan Nodes &amp; Batched Execution</div>
+      <div class="map-desc">
+        Plugging expressions into plan nodes. Batched execution for
+        performance. The <code>LazyFrame</code> wrapper. Schema propagation
+        without data.
+      </div>
+      <div class="map-files">→ plan.py, core.py, schema.py</div>
+    </div>
+  </div>
+  <div class="map-item">
+    <div class="map-num">4</div>
+    <div>
+      <div class="map-title">Advanced Algorithms — Hashing, Grouping &amp; Joins</div>
+      <div class="map-desc">
+        Hash joins, join variants (inner/left/full), hash aggregation
+        with running accumulators, and the sorted-stream alternatives
+        that use constant memory.
+      </div>
+      <div class="map-files">→ plan.py (JoinNode, AggNode)</div>
+    </div>
+  </div>
+  <div class="map-item">
+    <div class="map-num">5</div>
+    <div>
+      <div class="map-title">The Query Optimizer (Capstone)</div>
+      <div class="map-desc">
+        The payoff. Filter pushdown and column pruning — the optimizer walks
+        the plan tree, inspects the expression trees inside it, and rewrites
+        the plan to eliminate unnecessary work. Everything converges here.
+      </div>
+      <div class="map-files">→ plan.py (Optimizer)</div>
+    </div>
+  </div>
+</div>
+
+<p>
+Between Modules 4 and 5, there's a hands-on <strong>Interlude</strong>
+where you wire everything together into a complete mini-pipeline and watch
+it run. After Module 5, there are optional deep dives into streaming I/O
+and window functions for those who want to keep going.
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Your pace, your path</div>
+  This course is designed to be read front-to-back, but you don't have to
+  treat every section equally. If you're already comfortable with generators
+  and lazy evaluation, you can skim Modules 1–2 and focus on the interactive
+  code blocks. If you're here mainly for the optimizer payoff, skim the
+  algorithm details in Modules 3–4 and jump to Module 5. The code blocks
+  are self-contained — you'll get value from running them even if you
+  read the surrounding text quickly.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: What we don't cover -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">Honest Boundaries</span>
+  What We Won't Cover
+</h2>
+
+<p>
+pyfloe has more features than we can teach in five modules, and that's fine.
+The goal of this course isn't exhaustive documentation — it's deep
+understanding of the <em>architecture</em>. Here's what we're choosing to
+skip:
+</p>
+
+<p>
+<strong>Streaming I/O</strong> — pyfloe's file readers (<code>io.py</code>)
+use factory-based generators to stream CSV, TSV, and JSONL files
+with constant memory. We include a deep-dive appendix on this, but it's not
+part of the main five modules.
+</p>
+
+<p>
+<strong>Window functions</strong> — <code>row_number()</code>,
+<code>rank()</code>, <code>lag()</code>, <code>lead()</code>, and more.
+These follow the same expression pattern you'll learn in Module 2, but their
+execution involves sort-partition-scan logic that deserves its own treatment.
+We cover these in a bonus topic.
+</p>
+
+<p>
+<strong>Accessor methods</strong> — pyfloe supports <code>.str</code>
+(string methods like <code>upper</code>, <code>contains</code>,
+<code>replace</code>) and <code>.dt</code> (datetime extraction like
+<code>year</code>, <code>month</code>, <code>truncate</code>). These are
+straightforward once you understand the expression AST — they're just new
+node types.
+</p>
+
+<p>
+<strong>Pivot, unpivot, and explode</strong> — reshape operations that are
+useful but orthogonal to the core architecture.
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">The good news</div>
+  Every one of these features is built on the same foundation you <em>will</em>
+  learn: expressions, plan nodes, and the volcano model. Once you understand
+  the architecture, reading the code for window functions or streaming I/O
+  is a matter of following patterns you already know.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION: What This Course Is -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">One Last Thing</span>
+  How This Started
+</h2>
+
+<p>
+pyfloe wasn't some grand plan. I needed an engine for
+<a href="https://www.flowfile.io">Flowfile</a> — a visual data tool I was
+building — so I sat down and wrote one. Pure Python,
+<code>itertools</code>, <code>operator.itemgetter</code>, a lot of trial and
+error. Python is my language for everything — it's still my standard library
+for anything I build — so naturally the engine was Python too. It worked.
+Flowfile eventually moved to Polars, and the original engine went into a
+drawer.
+</p>
+
+<p>
+Years later, I looked back at that old code and saw something I hadn't
+appreciated at the time: there were some really fun patterns in there.
+Hash joins, expression trees, a little optimizer — all the same ideas that
+power the big libraries, just written in plain Python by someone who was
+figuring it out as he went. So I cleaned it up, restructured it a bit,
+and turned it into something I could use for teaching — to myself first,
+and now to others. That's pyfloe.
+</p>
+
+<p>
+This course is not going to teach you how to build pyfloe. You can clone
+the repo or <code>pip install</code> the thing — it's right there. But if
+you want to understand how something like this works well enough to build
+your <em>own</em> version, shaped the way that makes sense to <em>you</em>,
+this is the place to be.
+</p>
+
+<p>
+I always think I can design things better — and once you understand
+how something works, you will too.
+</p>
+
+<hr class="separator">
+
+<div class="source-references">
+  <h3>Source References</h3>
+  <h4>plan.py — Plan Nodes</h4>
+  <ul>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> — filters rows using an expression predicate</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> — reads data from a source</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a> — joins two plan trees together</li>
+  </ul>
+  <h4>core.py — LazyFrame API</h4>
+  <ul>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> — the public API that wraps plan nodes into a fluent interface</li>
+  </ul>
+  <h4>expr.py — Expression AST</h4>
+  <ul>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" class="source-link" target="_blank" rel="noopener"><code>col</code></a> — creates a column reference expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" class="source-link" target="_blank" rel="noopener"><code>lit</code></a> — creates a literal value expression</li>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20when" class="source-link" target="_blank" rel="noopener"><code>when</code></a> — conditional expression builder</li>
+  </ul>
+  <h4>stream.py — Streaming</h4>
+  <ul>
+    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> — streaming pipeline class</li>
+  </ul>
+</div>
+
+<hr class="separator">

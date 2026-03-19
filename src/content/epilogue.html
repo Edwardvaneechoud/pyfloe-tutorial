@@ -1,0 +1,349 @@
+<h1>Where Do You Go<br>from <em>Here</em>?</h1>
+
+<p class="subtitle">
+You came here to learn how libraries like Polars and PySpark work under the
+hood. You leave with something more useful: the vocabulary to reason about
+systems you haven't built yet.
+</p>
+
+<!-- ============================================================ -->
+
+<h2>What You Learned</h2>
+
+<p>
+Let's take stock. Over five modules, an interlude, and a deep dive, you
+traced the full architecture of a lazy dataframe engine — from first
+principles to a working optimizer. Not a surface tour. You went deep
+enough to understand <em>why</em> every piece exists and how they fit together.
+</p>
+
+<div class="recap-grid">
+  <div class="recap-card">
+    <h4>Module 1</h4>
+    <p>Generators, the Volcano Model, and the fundamental insight that
+    laziness isn't avoidance — it's architecture.</p>
+  </div>
+  <div class="recap-card">
+    <h4>Module 2</h4>
+    <p>Dunder methods, operator overloading, and the expression AST that
+    turns <code>col("a") + 1</code> from syntax into a tree you can inspect.</p>
+  </div>
+  <div class="recap-card">
+    <h4>Module 3</h4>
+    <p>Plan nodes, batched execution, schema propagation — the engine room
+    where expressions meet data and tuples start flowing.</p>
+  </div>
+  <div class="recap-card">
+    <h4>Module 4</h4>
+    <p>Hash joins, hash aggregation, running accumulators. The algorithms
+    that make <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20group_by" class="source-link" target="_blank" rel="noopener"><code>group_by</code></a> and <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20join" class="source-link" target="_blank" rel="noopener"><code>join</code></a> work in O(n).</p>
+  </div>
+  <div class="recap-card">
+    <h4>Interlude</h4>
+    <p>Everything wired together. A complete pipeline, end to end — and the
+    uncomfortable realization that it's doing too much work.</p>
+  </div>
+  <div class="recap-card">
+    <h4>Module 5</h4>
+    <p>The optimizer. Filter pushdown, column pruning, and the payoff for
+    every design decision that came before it.</p>
+  </div>
+</div>
+
+<p>
+That's not a surface-level tour. You now understand plan trees and
+expression trees — the two data structures that underpin every serious
+query system. You understand how they compose, how data flows through
+them, and how an optimizer rewrites them before a single row is read.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+
+<h2>Questions We Left Unanswered</h2>
+
+<p>
+On purpose. These aren't gaps in the course — they're the frontier.
+Each one is a real engineering problem with real tradeoffs. The reason you
+can now <em>think</em> about them is that you understand the architecture
+they sit on top of.
+</p>
+
+<div class="open-question">
+  <h4>Can you parallelize the engine?</h4>
+  <p>
+    Python's <code>multiprocessing</code> or <code>concurrent.futures</code>
+    could process batches across CPU cores. But the GIL, serialization
+    overhead, and batch coordination make this non-trivial. Polars uses
+    Rust's rayon for work-stealing parallelism &mdash; that's a fundamentally
+    different approach. What parts of the plan tree are embarrassingly
+    parallel, and what parts aren't?
+  </p>
+  <p class="hint">
+    <em>Starting point: FilterNode and ProjectNode process rows independently
+    &mdash; they're embarrassingly parallel. AggNode and SortNode need all
+    their input. What if you partitioned data by hash key and processed each
+    partition on a different core?</em>
+  </p>
+</div>
+
+<div class="open-question">
+  <h4>Can you make it truly streaming?</h4>
+  <p>
+    Our engine materializes for sorts, joins, and group-by. A true
+    streaming engine &mdash; like Flink or Kafka Streams &mdash; processes infinite,
+    unbounded data one event at a time. What would have to change in the
+    plan tree to support that? Which nodes survive, and which ones need
+    entirely new semantics?
+  </p>
+  <p class="hint">
+    <em>Starting point: the key constraint is unbounded aggregation. What if
+    <code>group_by</code> emitted partial results every N rows instead of
+    waiting for the stream to end? How would the downstream nodes handle
+    updates to previously emitted groups?</em>
+  </p>
+</div>
+
+<div class="open-question">
+  <h4>What if you rewrote the hot loops in Rust or C?</h4>
+  <p>
+    The volcano model and expression AST are <em>architecture</em>. They
+    don't care what language evaluates each node. PyO3 lets you write Rust
+    extensions callable from Python &mdash; you could keep the plan tree in
+    Python and drop to Rust for the inner loops. Polars goes further: the
+    entire engine is Rust, from the optimizer to the execution loops.
+    Python is just a thin binding layer on top. But the concepts are the
+    same ones you learned here.
+  </p>
+  <p class="hint">
+    <em>Starting point: what if just <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col.compile()</code></a> and
+    <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr.compile()</code></a> returned Rust-backed closures via
+    PyO3? The plan tree stays in Python; only the inner eval loop crosses
+    the language boundary. How much speedup would that give you?</em>
+  </p>
+</div>
+
+<div class="open-question">
+  <h4>What about a cost-based optimizer?</h4>
+  <p>
+    Our optimizer uses simple rules: push filters down, prune columns.
+    A cost-based optimizer would estimate the <em>size</em> of intermediate
+    results and choose between a hash join and a sort-merge join based on
+    which is cheaper. That requires statistics &mdash; row counts, cardinality
+    estimates, histograms. The plan tree is the same; the decision logic
+    is orders of magnitude more sophisticated.
+  </p>
+  <p class="hint">
+    <em>Starting point: add a <code>row_count</code> property to
+    <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a>. Now the optimizer knows the input size. For
+    a join, if one side has 100 rows and the other has 10 million, which
+    should be the build side? That's your first cost-based rule.</em>
+  </p>
+
+  <p style="margin-top: 16px; font-family: var(--sans); font-size: 14.5px;">
+    Here's a skeleton to get you started — add <code>row_count</code> to
+    the nodes and make the optimizer pick a build side:
+  </p>
+
+<pre data-executable data-label="Explore: cost-based join ordering"><code>class PlanNode:
+    def row_count(self):
+        """Estimate output rows. Override in subclasses."""
+        return None
+
+class ScanNode(PlanNode):
+    def __init__(self, name, rows):
+        self.name = name
+        self._rows = rows
+    def row_count(self):
+        return len(self._rows)
+
+class FilterNode(PlanNode):
+    def __init__(self, child, selectivity=0.1):
+        self.child = child
+        self.selectivity = selectivity
+    def row_count(self):
+        child_count = self.child.row_count()
+        if child_count is not None:
+            return int(child_count * self.selectivity)
+        return None
+
+class JoinNode(PlanNode):
+    def __init__(self, left, right):
+        self.left = left
+        self.right = right
+
+def pick_build_side(join):
+    """The smaller side should be the build (hash table) side."""
+    left_count = join.left.row_count()
+    right_count = join.right.row_count()
+    if left_count is not None and right_count is not None:
+        if right_count < left_count:
+            return "right", right_count
+        return "left", left_count
+    return "unknown", None
+
+# A big table filtered down, joined to a small lookup table
+big = FilterNode(ScanNode("orders", range(10_000_000)), selectivity=0.01)
+small = ScanNode("regions", range(50))
+join = JoinNode(big, small)
+
+side, count = pick_build_side(join)
+print(f"Left  (orders filtered): ~{big.row_count():,} rows")
+print(f"Right (regions):          {small.row_count()} rows")
+print(f"Build side: {side} ({count:,} rows) — much cheaper to hash")</code></pre>
+</div>
+
+<div class="open-question">
+  <h4>What about indexes?</h4>
+  <p>
+    Databases use B-trees and hash indexes to skip scanning entirely. Could
+    you add an index to <code>ScanNode</code> so that
+    <code>filter(col("id") == 42)</code> finds the row in O(log n) instead
+    of O(n)? What would change in the optimizer to exploit that?
+  </p>
+  <p class="hint">
+    <em>Starting point: the optimizer already inspects filter predicates
+    via <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a>. What if it also checked whether
+    the predicate is an equality check on an indexed column? It could
+    replace <code>ScanNode &rarr; FilterNode</code> with an
+    <code>IndexLookupNode</code>.</em>
+  </p>
+</div>
+
+<div class="open-question">
+  <h4>What about memory-mapped I/O and Arrow?</h4>
+  <p>
+    Apache Arrow defines a columnar memory format that eliminates
+    serialization. Polars, DuckDB, and DataFusion all use it. What if
+    <code>ScanNode</code> held Arrow arrays instead of Python tuples?
+    The plan tree stays the same. The storage layer beneath it transforms
+    completely.
+  </p>
+  <p class="hint">
+    <em>Starting point: <code>pip install pyarrow</code> and try
+    converting a pyfloe result to an Arrow table. The plan tree and
+    expression AST are independent of the storage format &mdash; that's
+    the whole point of the architecture you just learned.</em>
+  </p>
+</div>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The point</div>
+  None of these questions are rhetorical. They're the actual problems that
+  database engineers, query engine authors, and library maintainers work on
+  every day. You can now engage with them — read the papers, understand
+  the blog posts, follow the GitHub discussions — because you know what
+  a plan tree is, what an expression AST is, how a volcano iterator pulls
+  data, how a hash join partitions rows, and how an optimizer rewrites a
+  plan before execution begins. That's the foundation. Everything else
+  is iteration.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+
+<h2>The Source: pyfloe</h2>
+
+<p>
+Every line of "real code" in this course came from <strong>pyfloe</strong> — a
+zero-dependency, lazy dataframe library written in pure Python. It's not
+a teaching toy. It's a working library with expression trees, a volcano
+engine, hash joins, window functions, streaming I/O, and a rule-based
+optimizer — all in roughly 6,000 lines of readable Python.
+</p>
+
+<p>
+The codebase is open. You've already seen the most important parts. Now
+you can see the rest — the string methods, datetime accessors, pivot and
+unpivot, sorted merge joins, and everything else we acknowledged but
+chose not to cover. You have the vocabulary to read it all.
+</p>
+
+<div class="resource-card">
+  <div class="resource-icon docs">📖</div>
+  <div class="resource-body">
+    <h4><a href="https://edwardvaneechoud.github.io/pyfloe/" target="_blank" rel="noopener">
+      pyfloe Documentation
+    </a></h4>
+    <p>
+      Full API reference, getting-started guide, and architectural
+      documentation. Start here if you want to <em>use</em> pyfloe.
+      <code>pip install pyfloe</code> — zero dependencies.
+    </p>
+  </div>
+</div>
+
+<div class="resource-card">
+  <div class="resource-icon repo">🔧</div>
+  <div class="resource-body">
+    <h4><a href="https://github.com/edwardvaneechoud/pyfloe" target="_blank" rel="noopener">
+      pyfloe on GitHub
+    </a></h4>
+    <p>
+      The source code. Read it, fork it, break it, improve it. Every
+      module in this course maps to a specific file: <code>expr.py</code>,
+      <code>plan.py</code>, <code>optimize.py</code>, <code>io.py</code>.
+      You already know your way around.
+    </p>
+  </div>
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+
+<h2>A Final Thought</h2>
+
+<p>
+Libraries change. Polars will ship new features next month. Some new
+Rust-based engine will appear on Hacker News and everyone will argue
+about benchmarks. The architecture underneath them won't change —
+plan trees, expression ASTs, volcano iteration, hash partitioning,
+rule-based optimization. These aren't trends. They're decades old, and
+they'll outlast whatever's hot this year.
+</p>
+
+<p>
+The next time you see a query plan or an optimizer trace — in Polars,
+in Spark, in DuckDB — you'll recognize every piece. That's worth more
+than any API.
+</p>
+
+<p>
+Go build something.
+</p>
+
+<div class="source-references">
+  <h2>Source References</h2>
+  <div class="source-ref-group">
+    <h4>plan.py &mdash; Plan Nodes</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>core.py &mdash; LazyFrame API</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20group_by" target="_blank" rel="noopener">group_by()</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20join" target="_blank" rel="noopener">join()</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>expr.py &mdash; Expression AST</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" target="_blank" rel="noopener">Col</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener">BinaryExpr</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" target="_blank" rel="noopener">required_columns()</a></li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+
+<div class="closing-mark">
+  <div class="ornament">◆ &nbsp; ◆ &nbsp; ◆</div>
+  <div class="sign-off">End of course</div>
+</div>

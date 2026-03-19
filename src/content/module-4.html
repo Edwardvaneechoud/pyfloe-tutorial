@@ -1,0 +1,1305 @@
+<h1>Hashing, Grouping &amp;<br><em>Advanced Algorithms</em></h1>
+
+<p class="subtitle">
+We can scan, filter, project, and compute — all lazily, all in batches,
+all with schema propagation. But real data pipelines need two more things:
+combining data from multiple sources, and summarizing data into groups.
+These aren't just new plan nodes. They require <strong>real algorithms</strong>.
+</p>
+
+<p>
+Until now, every plan node we've built has been a streaming operation: it
+pulls a row from its child, does something to it, and hands it up. No
+buffering, no memory growth. That streak ends here. Joins need to build
+a lookup table. Aggregations need running accumulators. Both force us to
+think about <em>memory vs. speed</em> — the oldest tradeoff in computing.
+</p>
+
+<p>
+This module introduces two families of algorithms — hash-based and
+sort-based — and shows how they power the <code>GROUP BY</code> and
+<code>JOIN</code> operations that every data engineer writes daily. By
+the end, you'll understand the machinery behind
+<code>orders.join(customers, on="customer_id")</code> — and you'll have
+built it yourself.
+</p>
+
+<nav class="toc">
+  <div class="toc-title">In this module</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">4.1</span> The Hash Join</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">4.2</span> Join Variants — Inner, Left, Full</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">4.3</span> Hash Aggregation with Running Accumulators</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">4.4</span> The Sorted Alternative — O(1) Memory</a>
+</nav>
+
+
+<!-- ============================================================ -->
+<!-- LESSON 4.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Lesson 4.1</span>
+  The Hash Join
+</h2>
+
+<p>
+Here's a scenario every data pipeline encounters. You have two tables:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Two tables that need combining</div>
+<pre><code><span class="va">orders</span> <span class="op">=</span> [
+    (<span class="nu">1</span>, <span class="nu">101</span>, <span class="nu">250</span>),   <span class="cm"># (order_id, customer_id, amount)</span>
+    (<span class="nu">2</span>, <span class="nu">102</span>, <span class="nu">180</span>),
+    (<span class="nu">3</span>, <span class="nu">101</span>, <span class="nu">320</span>),
+    (<span class="nu">4</span>, <span class="nu">103</span>, <span class="nu">90</span>),
+]
+<span class="va">customers</span> <span class="op">=</span> [
+    (<span class="nu">101</span>, <span class="st">"Alice"</span>),   <span class="cm"># (customer_id, name)</span>
+    (<span class="nu">102</span>, <span class="st">"Bob"</span>),
+    (<span class="nu">103</span>, <span class="st">"Carol"</span>),
+]</code></pre>
+
+<p>
+You want to combine them: for each order, attach the customer's name. In
+SQL, this is <code>SELECT * FROM orders JOIN customers ON orders.customer_id = customers.customer_id</code>.
+Simple enough. But <em>how</em> do you actually implement that?
+</p>
+
+<h3>The naive approach: nested loops</h3>
+
+<p>
+The most obvious strategy is what you'd do by hand — for every order,
+scan through <em>all</em> customers looking for a match:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Nested-loop join</div>
+<pre><code><span class="kw">def</span> <span class="fn">nested_loop_join</span>(<span class="va">left</span>, <span class="va">right</span>, <span class="va">l_key</span>, <span class="va">r_key</span>):
+    <span class="va">results</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">l_row</span> <span class="kw">in</span> <span class="va">left</span>:
+        <span class="kw">for</span> <span class="va">r_row</span> <span class="kw">in</span> <span class="va">right</span>:
+            <span class="kw">if</span> <span class="va">l_row</span>[<span class="va">l_key</span>] <span class="op">==</span> <span class="va">r_row</span>[<span class="va">r_key</span>]:
+                <span class="va">results</span>.append(<span class="va">l_row</span> <span class="op">+</span> <span class="va">r_row</span>)
+    <span class="kw">return</span> <span class="va">results</span></code></pre>
+
+<p>
+It works. And for four orders and three customers, it's fine — 12
+comparisons. But think about what happens at scale.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The problem</div>
+  If you have 1 million orders and 100,000 customers, the nested loop performs
+  <strong>100 billion comparisons</strong>. That's O(n × m).
+  A query that should take milliseconds takes minutes. This is the same
+  performance cliff you'd get writing a linear search instead of using a
+  dictionary lookup.
+</div>
+
+<p>
+The fix is the same one Python uses for <code>dict</code> lookups: <strong>hashing</strong>.
+Instead of scanning the entire right table for every left row, we build a
+hash table from the right side <em>once</em>, then look up each left row's
+key in O(1).
+</p>
+
+<h3>The hash join algorithm</h3>
+
+<p>
+A hash join has two phases:
+</p>
+
+<p>
+<strong>Phase 1 — Build.</strong> Iterate through the <em>right</em> (smaller)
+table and insert every row into a dictionary keyed by the join column.
+This costs O(m) time and O(m) memory, where m is the size of the right table.
+</p>
+
+<p>
+<strong>Phase 2 — Probe.</strong> Stream through the <em>left</em> (larger)
+table. For each row, extract its key and look it up in the dictionary.
+If there's a match, combine the rows. This costs O(n) time, where n is
+the size of the left table.
+</p>
+
+<p>
+Total: O(n + m) time, O(m) memory. That's a <em>massive</em> improvement
+over O(n × m).
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Hash join — our simplified version</div>
+<pre><code><span class="kw">from</span> <span class="va">collections</span> <span class="kw">import</span> <span class="fn">defaultdict</span>
+
+<span class="kw">def</span> <span class="fn">hash_join</span>(<span class="va">left</span>, <span class="va">right</span>, <span class="va">l_key</span>, <span class="va">r_key</span>):
+    <span class="cm"># Phase 1: Build hash table from the right side</span>
+    <span class="va">index</span> <span class="op">=</span> <span class="fn">defaultdict</span>(<span class="bi">list</span>)
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">right</span>:
+        <span class="va">index</span>[<span class="va">row</span>[<span class="va">r_key</span>]].append(<span class="va">row</span>)
+
+    <span class="cm"># Phase 2: Probe with the left side</span>
+    <span class="va">results</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">left</span>:
+        <span class="kw">for</span> <span class="va">match</span> <span class="kw">in</span> <span class="va">index</span>[<span class="va">row</span>[<span class="va">l_key</span>]]:
+            <span class="va">results</span>.append(<span class="va">row</span> <span class="op">+</span> <span class="va">match</span>)
+    <span class="kw">return</span> <span class="va">results</span></code></pre>
+
+<p>
+Notice the <code>defaultdict(list)</code>. When we look up a key that
+doesn't exist, we get an empty list instead of a <code>KeyError</code>.
+This matters because a single customer can have many orders — the hash
+table maps each key to a <em>list</em> of matching rows, not a single row.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Why build from the right?</div>
+  Convention in query engines is to build the hash table from the
+  <strong>smaller</strong> side (the "build" side) and stream the
+  <strong>larger</strong> side (the "probe" side). This minimizes memory
+  usage. pyfloe builds from the right side (by convention, the smaller
+  table). If you have a huge fact table (orders) and a small
+  dimension table (customers), put the small one on the right.
+</div>
+
+<pre data-executable data-label="Hash join in action"><code>import pyfloe as pf
+
+orders = pf.LazyFrame([
+    {"order_id": 1, "customer_id": 101, "amount": 250},
+    {"order_id": 2, "customer_id": 102, "amount": 180},
+    {"order_id": 3, "customer_id": 101, "amount": 320},
+    {"order_id": 4, "customer_id": 103, "amount": 90},
+])
+customers = pf.LazyFrame([
+    {"customer_id": 101, "name": "Alice"},
+    {"customer_id": 102, "name": "Bob"},
+    {"customer_id": 103, "name": "Carol"},
+])
+
+# pyfloe uses a hash join internally — see the plan
+joined = orders.join(customers, on="customer_id")
+print(joined.explain())
+print()
+
+# Execute and see the result
+joined.collect()
+for row in joined.to_pylist():
+    print(f"  Order {row['order_id']}: ${row['amount']} — {row['name']}")
+
+# Under the hood, pyfloe's JoinNode builds a hash table
+# from the right side (customers), then probes it with
+# each row from the left side (orders). O(n+m) instead of O(n*m).
+print(f"\nInternal plan node: {type(joined._plan).__name__}")</code></pre>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Try it yourself</div>
+  Modify the code above. Change <code>on="customer_id"</code> to
+  <code>how="left"</code> and add a customer with no orders &mdash; say,
+  <code>{"customer_id": 105, "name": "Eve"}</code>. What happens to Eve
+  in the result? Now try <code>how="full"</code>. Add an order with a
+  <code>customer_id</code> that doesn't exist in the customers table.
+  Where do the <code>None</code> values appear?
+</div>
+
+<h3>From indices to key functions</h3>
+
+<p>
+Our simplified version uses a single integer index for the join key. But
+real-world joins often use <em>multiple</em> columns —
+<code>JOIN ON a.year = b.year AND a.region = b.region</code>. We need a
+function that extracts a composite key as a tuple.
+</p>
+
+<p>
+This is where Python's <code>operator.itemgetter</code> enters the picture.
+It's a stdlib function that creates a fast key-extraction callable:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> itemgetter — fast tuple indexing from the stdlib</div>
+<pre><code><span class="kw">from</span> <span class="va">operator</span> <span class="kw">import</span> <span class="fn">itemgetter</span>
+
+<span class="va">row</span> <span class="op">=</span> (<span class="st">"EU"</span>, <span class="nu">2024</span>, <span class="st">"Alice"</span>, <span class="nu">250</span>)
+
+<span class="cm"># Extract columns 0 and 1 as a composite key</span>
+<span class="va">get_key</span> <span class="op">=</span> <span class="fn">itemgetter</span>(<span class="nu">0</span>, <span class="nu">1</span>)
+<span class="fn">get_key</span>(<span class="va">row</span>)   <span class="cm"># → ("EU", 2024)</span></code></pre>
+
+<p>
+Why not just use a lambda like <code>lambda row: (row[0], row[1])</code>?
+Because <code>itemgetter</code> is implemented in C — it's 2–5× faster
+than an equivalent lambda for tuple indexing. When you're extracting keys
+from millions of rows in a tight loop, that difference adds up.
+</p>
+
+<p>
+pyfloe wraps this in a small helper that handles both single-column and
+multi-column keys:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's _make_key_fn — plan.py</div>
+<pre><code><span class="kw">def</span> <span class="fn">_make_key_fn</span>(<span class="va">indices</span>: <span class="bi">list</span>[<span class="bi">int</span>]) <span class="op">-&gt;</span> Callable[[<span class="bi">tuple</span>], <span class="bi">tuple</span>]:
+    <span class="kw">if</span> <span class="fn">len</span>(<span class="va">indices</span>) <span class="op">==</span> <span class="nu">1</span>:
+        <span class="va">idx</span> <span class="op">=</span> <span class="va">indices</span>[<span class="nu">0</span>]
+        <span class="kw">return</span> <span class="kw">lambda</span> <span class="va">row</span>: (<span class="va">row</span>[<span class="va">idx</span>],)
+    <span class="kw">return</span> <span class="fn">itemgetter</span>(<span class="op">*</span><span class="va">indices</span>)</code></pre>
+
+<p>
+For a single-column key, it wraps the value in a tuple so the return type
+is always consistent. For multi-column keys, it delegates straight to
+<code>itemgetter</code>. This tiny function gets called for every single
+row in both the build and probe phases — making it fast matters.
+</p>
+
+<h3>pyfloe's JoinNode — the real implementation</h3>
+
+<p>
+Now let's look at the actual <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a>. The structure follows
+our simplified version closely, but it integrates with the plan tree
+(schema, batched execution) and handles the details we glossed over.
+Let's take it in stages.
+</p>
+
+<p>
+First, the class skeleton. Like every plan node, it uses
+<code>__slots__</code> and stores references to its two child nodes:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> JoinNode — class definition (plan.py)</div>
+<pre><code><span class="kw">class</span> <span class="cl">JoinNode</span>(<span class="cl">PlanNode</span>):
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"left"</span>, <span class="st">"right"</span>, <span class="st">"left_on"</span>, <span class="st">"right_on"</span>, <span class="st">"how"</span>)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">left</span>, <span class="va">right</span>,
+                 <span class="va">left_on</span>: <span class="bi">list</span>[<span class="bi">str</span>],
+                 <span class="va">right_on</span>: <span class="bi">list</span>[<span class="bi">str</span>],
+                 <span class="va">how</span>: JoinHow <span class="op">=</span> <span class="st">"inner"</span>):
+        <span class="va">self</span>.left <span class="op">=</span> <span class="va">left</span>
+        <span class="va">self</span>.right <span class="op">=</span> <span class="va">right</span>
+        <span class="va">self</span>.left_on <span class="op">=</span> <span class="va">left_on</span>
+        <span class="va">self</span>.right_on <span class="op">=</span> <span class="va">right_on</span>
+        <span class="va">self</span>.how <span class="op">=</span> <span class="va">how</span>
+
+    <span class="kw">def</span> <span class="fn">schema</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="kw">return</span> <span class="va">self</span>.left.schema().merge(<span class="va">self</span>.right.schema())</code></pre>
+
+<p>
+Notice the <code>schema()</code> method: a join's output contains all
+columns from both sides, so it <em>merges</em> the two schemas. No data
+is touched — this runs at plan-build time, not execution time.
+</p>
+
+<p>
+Now the heart of it — <code>execute_batched()</code>. The build phase
+consumes the entire right side into a <code>defaultdict</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> JoinNode — build phase (plan.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> Iterator[<span class="bi">list</span>[<span class="bi">tuple</span>]]:
+    <span class="va">rs</span> <span class="op">=</span> <span class="va">self</span>.right.schema()
+    <span class="va">r_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">rs</span>.column_names)}
+    <span class="va">r_idx</span> <span class="op">=</span> [<span class="va">r_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>.right_on]
+    <span class="va">r_key</span> <span class="op">=</span> <span class="fn">_make_key_fn</span>(<span class="va">r_idx</span>)
+
+    <span class="va">right_ht</span>: <span class="bi">dict</span>[<span class="bi">tuple</span>, <span class="bi">list</span>] <span class="op">=</span> <span class="fn">defaultdict</span>(<span class="bi">list</span>)
+    <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.right.execute_batched():
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">chunk</span>:
+            <span class="va">right_ht</span>[<span class="fn">r_key</span>(<span class="va">row</span>)].append(<span class="va">row</span>)</code></pre>
+
+<p>
+Line by line: it resolves column <em>names</em> (<code>"customer_id"</code>)
+to column <em>indices</em> (position in the tuple) using the schema. Then
+it builds the key function and populates the hash table. The pattern
+<code>r_map</code> → <code>r_idx</code> → <code>_make_key_fn</code> is a
+recurring idiom in pyfloe — you'll see it in <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" class="source-link" target="_blank" rel="noopener"><code>AggNode</code></a> too.
+</p>
+
+<p>
+Then the probe phase streams the left side, looking up each key:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> JoinNode — probe phase (inner join only, for now)</div>
+<pre><code>    <span class="va">ls</span> <span class="op">=</span> <span class="va">self</span>.left.schema()
+    <span class="va">l_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">ls</span>.column_names)}
+    <span class="va">l_idx</span> <span class="op">=</span> [<span class="va">l_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>.left_on]
+    <span class="va">l_key</span> <span class="op">=</span> <span class="fn">_make_key_fn</span>(<span class="va">l_idx</span>)
+
+    <span class="va">buf</span>: <span class="bi">list</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.left.execute_batched():
+        <span class="kw">for</span> <span class="va">left_row</span> <span class="kw">in</span> <span class="va">chunk</span>:
+            <span class="va">key</span> <span class="op">=</span> <span class="fn">l_key</span>(<span class="va">left_row</span>)
+            <span class="va">matches</span> <span class="op">=</span> <span class="va">right_ht</span>.get(<span class="va">key</span>)
+            <span class="kw">if</span> <span class="va">matches</span>:
+                <span class="kw">for</span> <span class="va">right_row</span> <span class="kw">in</span> <span class="va">matches</span>:
+                    <span class="va">buf</span>.append(<span class="va">left_row</span> <span class="op">+</span> <span class="va">right_row</span>)
+            <span class="kw">if</span> <span class="fn">len</span>(<span class="va">buf</span>) <span class="op">&gt;=</span> <span class="va">_BATCH_SIZE</span>:
+                <span class="kw">yield</span> <span class="va">buf</span>
+                <span class="va">buf</span> <span class="op">=</span> []
+    <span class="kw">if</span> <span class="va">buf</span>:
+        <span class="kw">yield</span> <span class="va">buf</span></code></pre>
+
+<p>
+Two things to notice. First, <code>left_row + right_row</code> — because
+rows are tuples, concatenation is just <code>+</code>. An order tuple
+<code>(1, 101, 250)</code> joined with a customer tuple
+<code>(101, "Alice")</code> becomes <code>(1, 101, 250, 101, "Alice")</code>.
+</p>
+
+<p>
+Second, the output buffering. Results accumulate in <code>buf</code>
+and are yielded in batches of <code>_BATCH_SIZE</code> (1024). This is
+the same batching pattern from Module 3 — the join produces data in chunks,
+keeping memory predictable even when there are many matches.
+</p>
+
+<p>
+When you write <code>orders.join(customers, on="customer_id")</code> in
+Polars or pyfloe, this is the algorithm. The right table becomes a hash map,
+the left streams through probing it, and results come out in batches.
+O(n + m) is why joins on millions of rows return in seconds.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 4.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Lesson 4.2</span>
+  Join Variants — Inner, Left, Full
+</h2>
+
+<p>
+The code we just saw implements an <strong>inner join</strong> — it only
+emits rows where both sides have a matching key. But what about an order
+whose customer got deleted? Or a customer who hasn't placed any orders yet?
+Different join types handle these cases differently.
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-hash">Inner</span> Both sides must match</h4>
+    <p>
+      Only emit a row when the left key finds a match in the right hash table.
+      Unmatched rows from either side are silently dropped.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-hash">Left</span> Keep every left row</h4>
+    <p>
+      If a left row has no match, emit it anyway with <code>None</code> for
+      all right columns. No left row is ever lost.
+    </p>
+  </div>
+</div>
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-hash">Full</span> Keep everything</h4>
+    <p>
+      Keep all unmatched left rows (null-filled right) <em>and</em> all
+      unmatched right rows (null-filled left). Nothing is dropped.
+    </p>
+  </div>
+  <div class="comparison-card" style="border: 1px dashed var(--border);">
+    <h4 style="color: var(--text-muted);">Right join?</h4>
+    <p style="color: var(--text-muted);">
+      A right join is just a left join with the sides swapped.
+      pyfloe (and Polars) don't provide a separate right join — you simply
+      switch which table goes on which side.
+    </p>
+  </div>
+</div>
+
+<p>
+The key insight is that join variants don't change the <em>algorithm</em>.
+The build-and-probe structure is identical. What changes is what happens
+when a key has <strong>no match</strong>.
+</p>
+
+<h3>Null padding</h3>
+
+<p>
+When a left row has no match in a left join, we need to fill the right
+side's columns with <code>None</code>. pyfloe precomputes a "null row"
+tuple so it can be appended cheaply:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Precomputed null rows</div>
+<pre><code><span class="va">null_right</span> <span class="op">=</span> (<span class="kw">None</span>,) <span class="op">*</span> <span class="fn">len</span>(<span class="va">rs</span>.column_names)
+<span class="va">null_left</span>  <span class="op">=</span> (<span class="kw">None</span>,) <span class="op">*</span> <span class="fn">len</span>(<span class="va">ls</span>.column_names)</code></pre>
+
+<p>
+If the right table has 4 columns, <code>null_right</code> is
+<code>(None, None, None, None)</code>. This tuple is created once and
+reused for every unmatched row — a small but important optimization when
+thousands of rows don't match.
+</p>
+
+<h3>The full probe loop with join variants</h3>
+
+<p>
+Here's how the probe phase actually looks in pyfloe, with all three
+join types handled:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> JoinNode — probe phase with variants (plan.py)</div>
+<pre><code>    <span class="va">matched_keys</span>: <span class="bi">set</span> <span class="op">=</span> <span class="fn">set</span>()
+    <span class="va">buf</span>: <span class="bi">list</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.left.execute_batched():
+        <span class="kw">for</span> <span class="va">left_row</span> <span class="kw">in</span> <span class="va">chunk</span>:
+            <span class="va">key</span> <span class="op">=</span> <span class="fn">l_key</span>(<span class="va">left_row</span>)
+            <span class="va">matches</span> <span class="op">=</span> <span class="va">right_ht</span>.get(<span class="va">key</span>)
+            <span class="kw">if</span> <span class="va">matches</span>:
+                <span class="va">matched_keys</span>.add(<span class="va">key</span>)
+                <span class="kw">for</span> <span class="va">right_row</span> <span class="kw">in</span> <span class="va">matches</span>:
+                    <span class="va">buf</span>.append(<span class="va">left_row</span> <span class="op">+</span> <span class="va">right_row</span>)
+            <span class="kw">elif</span> <span class="va">self</span>.how <span class="kw">in</span> (<span class="st">"left"</span>, <span class="st">"full"</span>):
+                <span class="va">buf</span>.append(<span class="va">left_row</span> <span class="op">+</span> <span class="va">null_right</span>)
+            <span class="kw">if</span> <span class="fn">len</span>(<span class="va">buf</span>) <span class="op">&gt;=</span> <span class="va">_BATCH_SIZE</span>:
+                <span class="kw">yield</span> <span class="va">buf</span>
+                <span class="va">buf</span> <span class="op">=</span> []</code></pre>
+
+<p>
+Walk through it: when there's a match, we record the key in
+<code>matched_keys</code> and emit the combined row. When there's <em>no</em>
+match and this is a left or full join, we emit the left row padded with
+nulls. For an inner join, unmatched rows simply disappear — the
+<code>elif</code> never fires.
+</p>
+
+<p>
+But a full join needs one more pass. After processing all left rows, there
+may be right-side rows whose keys were <em>never</em> matched. That's what
+<code>matched_keys</code> is for:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> JoinNode — full join: emit unmatched right rows</div>
+<pre><code>    <span class="kw">if</span> <span class="va">self</span>.how <span class="op">==</span> <span class="st">"full"</span>:
+        <span class="kw">for</span> <span class="va">key</span>, <span class="va">rows</span> <span class="kw">in</span> <span class="va">right_ht</span>.items():
+            <span class="kw">if</span> <span class="va">key</span> <span class="kw">not in</span> <span class="va">matched_keys</span>:
+                <span class="kw">for</span> <span class="va">right_row</span> <span class="kw">in</span> <span class="va">rows</span>:
+                    <span class="va">buf</span>.append(<span class="va">null_left</span> <span class="op">+</span> <span class="va">right_row</span>)
+                <span class="kw">if</span> <span class="fn">len</span>(<span class="va">buf</span>) <span class="op">&gt;=</span> <span class="va">_BATCH_SIZE</span>:
+                    <span class="kw">yield</span> <span class="va">buf</span>
+                    <span class="va">buf</span> <span class="op">=</span> []
+    <span class="kw">if</span> <span class="va">buf</span>:
+        <span class="kw">yield</span> <span class="va">buf</span></code></pre>
+
+<p>
+It iterates over the entire hash table, finds keys that were never
+matched during the probe, and emits those right rows padded with
+<code>null_left</code>. This is the only place in the algorithm that
+touches the hash table twice — and only for full joins.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The JoinHow type</div>
+  pyfloe defines <code>JoinHow = Literal["inner", "left", "full"]</code>
+  in <code>expr.py</code> — a <code>Literal</code> type that restricts the
+  allowed values to exactly three strings. This gives you IDE autocomplete,
+  type-checker guarantees, and a clear signal to anyone reading the code that
+  no other join types exist. It's a small touch of type-driven design that
+  costs nothing at runtime.
+</div>
+
+<p>
+In Polars, PySpark, or pyfloe, the <code>how</code> parameter maps
+directly to these <code>if</code>/<code>elif</code> branches. The
+hash-build-and-probe algorithm is identical — only the unmatched-key
+handling differs.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 4.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Lesson 4.3</span>
+  Hash Aggregation with Running Accumulators
+</h2>
+
+<p>
+Joins combine rows from two tables. Aggregation does the opposite — it
+<em>collapses</em> rows. A million rows of individual transactions become
+a handful of rows summarizing totals per region, averages per product, or
+counts per day. In SQL: <code>SELECT region, SUM(amount) FROM orders GROUP BY region</code>.
+</p>
+
+<p>
+The question, as always, is: <em>how?</em>
+</p>
+
+<h3>The naive approach: collect everything, then compute</h3>
+
+<p>
+The simplest strategy is to group all the rows first, then apply the
+aggregation function to each group:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Collect-then-aggregate</div>
+<pre><code><span class="kw">from</span> <span class="va">collections</span> <span class="kw">import</span> <span class="fn">defaultdict</span>
+
+<span class="kw">def</span> <span class="fn">naive_group_by_sum</span>(<span class="va">rows</span>, <span class="va">key_col</span>, <span class="va">val_col</span>):
+    <span class="va">groups</span> <span class="op">=</span> <span class="fn">defaultdict</span>(<span class="bi">list</span>)
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">rows</span>:
+        <span class="va">groups</span>[<span class="va">row</span>[<span class="va">key_col</span>]].append(<span class="va">row</span>[<span class="va">val_col</span>])
+
+    <span class="kw">return</span> {<span class="va">k</span>: <span class="fn">sum</span>(<span class="va">vals</span>) <span class="kw">for</span> <span class="va">k</span>, <span class="va">vals</span> <span class="kw">in</span> <span class="va">groups</span>.items()}</code></pre>
+
+<p>
+This works, but look at what it stores: <strong>every single value</strong>
+for every group. If you have 10 million orders across 50 regions, this
+collects 10 million integers into 50 lists before computing a single sum.
+Memory usage is O(n) — proportional to the total number of rows, not the
+number of groups.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The problem</div>
+  Storing all values to compute a sum is wasteful. You don't need to remember
+  every individual number — you just need a <strong>running total</strong>.
+  The same is true for count, min, max, and mean. Only
+  <code>n_unique</code> truly requires storing every value. For most
+  aggregations, we can maintain a tiny accumulator per group instead of a
+  growing list.
+</div>
+
+<h3>Running accumulators — O(k) memory</h3>
+
+<p>
+The insight is simple: instead of storing <em>all values</em> per group,
+store only the <strong>accumulator state</strong> you need to compute the
+final result. For a sum, that's a single running total. For a mean, it's
+a running sum and a count. For min/max, it's the current extremum.
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Running-accumulator aggregation</div>
+<pre><code><span class="kw">def</span> <span class="fn">running_group_by_sum</span>(<span class="va">rows</span>, <span class="va">key_col</span>, <span class="va">val_col</span>):
+    <span class="va">accumulators</span> <span class="op">=</span> {}  <span class="cm"># key → running_sum</span>
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">rows</span>:
+        <span class="va">key</span> <span class="op">=</span> <span class="va">row</span>[<span class="va">key_col</span>]
+        <span class="va">val</span> <span class="op">=</span> <span class="va">row</span>[<span class="va">val_col</span>]
+        <span class="kw">if</span> <span class="va">key</span> <span class="kw">not in</span> <span class="va">accumulators</span>:
+            <span class="va">accumulators</span>[<span class="va">key</span>] <span class="op">=</span> <span class="nu">0</span>
+        <span class="va">accumulators</span>[<span class="va">key</span>] <span class="op">+=</span> <span class="va">val</span>
+    <span class="kw">return</span> <span class="va">accumulators</span></code></pre>
+
+<p>
+Memory usage drops from O(n) to O(k), where k is the number of distinct
+groups. If you're summarizing 10 million rows into 50 regions, you store
+50 integers instead of 10 million. That's the difference between
+megabytes and bytes.
+</p>
+
+<h3>Generalizing accumulators</h3>
+
+<p>
+The running-sum approach works for <code>sum</code>, but what about
+<code>mean</code>, <code>min</code>, <code>count</code>? Each aggregation
+needs its own accumulator shape and update logic. pyfloe solves this with
+three small functions that work as a team:
+</p>
+
+<p>
+<strong><code>_init_acc(agg)</code></strong> — creates the initial
+accumulator state. <code>sum</code> needs just <code>{"s": 0}</code>.
+<code>mean</code> needs <code>{"s": 0.0, "n": 0}</code> (running sum and count).
+<code>first</code> uses a flag to capture only the first non-null value.
+</p>
+
+<details class="deep-dive">
+<summary>Full accumulator init and finalize code</summary>
+<div class="deep-dive-body">
+<div class="code-label"><span class="dot dot-pyfloe"></span> Accumulator initialization (plan.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_init_acc</span>(<span class="va">agg</span>: <span class="cl">AggExpr</span>) <span class="op">-&gt;</span> <span class="bi">dict</span>:
+    <span class="va">kind</span> <span class="op">=</span> <span class="va">agg</span>.agg_name
+    <span class="kw">if</span>   <span class="va">kind</span> <span class="op">==</span> <span class="st">"sum"</span>:      <span class="kw">return</span> {<span class="st">"s"</span>: <span class="nu">0</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"count"</span>:    <span class="kw">return</span> {<span class="st">"n"</span>: <span class="nu">0</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"mean"</span>:     <span class="kw">return</span> {<span class="st">"s"</span>: <span class="nu">0.0</span>, <span class="st">"n"</span>: <span class="nu">0</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"min"</span>:      <span class="kw">return</span> {<span class="st">"v"</span>: <span class="kw">None</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"max"</span>:      <span class="kw">return</span> {<span class="st">"v"</span>: <span class="kw">None</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"first"</span>:    <span class="kw">return</span> {<span class="st">"v"</span>: <span class="kw">None</span>, <span class="st">"set"</span>: <span class="kw">False</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"last"</span>:     <span class="kw">return</span> {<span class="st">"v"</span>: <span class="kw">None</span>}
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"n_unique"</span>: <span class="kw">return</span> {<span class="st">"s"</span>: <span class="fn">set</span>()}
+    <span class="kw">else</span>:                    <span class="kw">return</span> {<span class="st">"vals"</span>: []}</code></pre>
+
+<p>
+<strong><code>_make_updater(agg)</code></strong> — returns a function that
+knows how to update a specific accumulator type:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Accumulator updaters (plan.py, abridged)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_make_updater</span>(<span class="va">agg</span>: <span class="cl">AggExpr</span>) <span class="op">-&gt;</span> Callable:
+    <span class="va">kind</span> <span class="op">=</span> <span class="va">agg</span>.agg_name
+    <span class="kw">if</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"sum"</span>:
+        <span class="kw">def</span> <span class="fn">_update</span>(<span class="va">acc</span>, <span class="va">val</span>):
+            <span class="kw">if</span> <span class="va">val</span> <span class="kw">is not</span> <span class="kw">None</span>: <span class="va">acc</span>[<span class="st">"s"</span>] <span class="op">+=</span> <span class="va">val</span>
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"count"</span>:
+        <span class="kw">def</span> <span class="fn">_update</span>(<span class="va">acc</span>, <span class="va">val</span>):
+            <span class="kw">if</span> <span class="va">val</span> <span class="kw">is not</span> <span class="kw">None</span>: <span class="va">acc</span>[<span class="st">"n"</span>] <span class="op">+=</span> <span class="nu">1</span>
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"min"</span>:
+        <span class="kw">def</span> <span class="fn">_update</span>(<span class="va">acc</span>, <span class="va">val</span>):
+            <span class="kw">if</span> <span class="va">val</span> <span class="kw">is not</span> <span class="kw">None</span>:
+                <span class="kw">if</span> <span class="va">acc</span>[<span class="st">"v"</span>] <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> <span class="va">val</span> <span class="op">&lt;</span> <span class="va">acc</span>[<span class="st">"v"</span>]:
+                    <span class="va">acc</span>[<span class="st">"v"</span>] <span class="op">=</span> <span class="va">val</span>
+    <span class="cm"># ... max, mean, first, last, n_unique follow the same pattern</span>
+    <span class="kw">return</span> <span class="va">_update</span></code></pre>
+
+<p>
+Each updater is a closure that captures the accumulator shape. The
+<code>if val is not None</code> guard is critical — nulls are skipped,
+matching the SQL convention that <code>SUM</code> ignores nulls.
+</p>
+
+<p>
+<strong><code>_finalize_acc(acc, agg)</code></strong> — extracts the final
+result from the accumulator:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Accumulator finalization (plan.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">_finalize_acc</span>(<span class="va">acc</span>: <span class="bi">dict</span>, <span class="va">agg</span>: <span class="cl">AggExpr</span>) <span class="op">-&gt;</span> Any:
+    <span class="va">kind</span> <span class="op">=</span> <span class="va">agg</span>.agg_name
+    <span class="kw">if</span>   <span class="va">kind</span> <span class="op">==</span> <span class="st">"sum"</span>:      <span class="kw">return</span> <span class="va">acc</span>[<span class="st">"s"</span>]
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"count"</span>:    <span class="kw">return</span> <span class="va">acc</span>[<span class="st">"n"</span>]
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"mean"</span>:
+        <span class="kw">return</span> <span class="va">acc</span>[<span class="st">"s"</span>] <span class="op">/</span> <span class="va">acc</span>[<span class="st">"n"</span>] <span class="kw">if</span> <span class="va">acc</span>[<span class="st">"n"</span>] <span class="kw">else</span> <span class="nu">0.0</span>
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="kw">in</span> (<span class="st">"min"</span>, <span class="st">"max"</span>, <span class="st">"first"</span>, <span class="st">"last"</span>):
+        <span class="kw">return</span> <span class="va">acc</span>[<span class="st">"v"</span>]
+    <span class="kw">elif</span> <span class="va">kind</span> <span class="op">==</span> <span class="st">"n_unique"</span>:
+        <span class="kw">return</span> <span class="fn">len</span>(<span class="va">acc</span>[<span class="st">"s"</span>])
+    <span class="kw">else</span>:
+        <span class="kw">return</span> <span class="va">agg</span>.eval_agg(<span class="va">acc</span>[<span class="st">"vals"</span>])</code></pre>
+
+<p>
+The <code>mean</code> case divides the running sum by the count — only possible because
+the accumulator tracked both. <code>n_unique</code> returns the size of the set.
+</p>
+</div>
+</details>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The init → update → finalize pattern</div>
+  This three-phase accumulator pattern isn't unique to pyfloe — it's
+  everywhere. MapReduce uses it. Spark's <code>Aggregator</code> class
+  has <code>zero</code>, <code>reduce</code>, and <code>merge</code>.
+  Polars' internal aggregation kernels follow the same structure. Once you
+  recognize the pattern, you'll see it in every system that needs to
+  summarize large datasets without materializing them.
+</div>
+
+<h3>The AggNode — wiring it together</h3>
+
+<p>
+The three helper functions handle individual accumulators. The
+<code>AggNode</code> orchestrates them across all groups and all
+aggregation expressions. Here's how it consumes its input:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> AggNode.execute_batched — the core loop (plan.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> Iterator[<span class="bi">list</span>[<span class="bi">tuple</span>]]:
+    <span class="va">col_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(
+        <span class="va">self</span>.child.schema().column_names)}
+    <span class="va">g_idx</span> <span class="op">=</span> [<span class="va">col_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>.group_by]
+    <span class="va">key_fn</span> <span class="op">=</span> <span class="fn">_make_key_fn</span>(<span class="va">g_idx</span>)
+    <span class="va">n_aggs</span> <span class="op">=</span> <span class="fn">len</span>(<span class="va">self</span>.agg_exprs)
+
+    <span class="cm"># Pre-compile expression evaluators and updaters</span>
+    <span class="va">compiled_evals</span> <span class="op">=</span> [<span class="va">a</span>.expr.compile(<span class="va">col_map</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+    <span class="va">updaters</span> <span class="op">=</span> [<span class="fn">_make_updater</span>(<span class="va">a</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+
+    <span class="va">accumulators</span>: <span class="bi">dict</span>[<span class="bi">tuple</span>, <span class="bi">list</span>] <span class="op">=</span> {}</code></pre>
+
+<p>
+Setup: resolve group-by column names to indices, build the key function
+(same <code>_make_key_fn</code> we saw in <code>JoinNode</code>), and
+pre-compile the expression evaluators and updaters. The
+<code>compiled_evals</code> list contains one fast callable per
+aggregation — each knows how to extract its value from a tuple row.
+The <code>updaters</code> list contains the corresponding accumulator
+update functions.
+</p>
+
+<p>
+Then the main loop processes every row:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> AggNode — row processing loop</div>
+<pre><code>    <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">chunk</span>:
+            <span class="va">key</span> <span class="op">=</span> <span class="fn">key_fn</span>(<span class="va">row</span>)
+            <span class="kw">try</span>:
+                <span class="va">accs</span> <span class="op">=</span> <span class="va">accumulators</span>[<span class="va">key</span>]
+            <span class="kw">except</span> <span class="cl">KeyError</span>:
+                <span class="va">accs</span> <span class="op">=</span> [<span class="fn">_init_acc</span>(<span class="va">a</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+                <span class="va">accumulators</span>[<span class="va">key</span>] <span class="op">=</span> <span class="va">accs</span>
+            <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="va">n_aggs</span>):
+                <span class="va">updaters</span>[<span class="va">i</span>](<span class="va">accs</span>[<span class="va">i</span>], <span class="va">compiled_evals</span>[<span class="va">i</span>](<span class="va">row</span>))</code></pre>
+
+<p>
+For each row: extract the group key, look up (or create) the accumulator
+list, then update every accumulator. Notice the <code>try</code>/<code>except KeyError</code>
+instead of <code>if key not in accumulators</code> — this is a deliberate
+micro-optimization. In Python, the "ask forgiveness" (EAFP) pattern is
+faster when misses are rare, which is the case once most groups have been
+seen.
+</p>
+
+<p>
+After consuming all input, the accumulators are finalized and emitted:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> AggNode — emit results</div>
+<pre><code>    <span class="va">buf</span>: <span class="bi">list</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">key</span>, <span class="va">accs</span> <span class="kw">in</span> <span class="va">accumulators</span>.items():
+        <span class="va">agg_vals</span> <span class="op">=</span> <span class="fn">tuple</span>(
+            <span class="fn">_finalize_acc</span>(<span class="va">accs</span>[<span class="va">i</span>], <span class="va">self</span>.agg_exprs[<span class="va">i</span>])
+            <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="va">n_aggs</span>)
+        )
+        <span class="va">buf</span>.append(<span class="va">key</span> <span class="op">+</span> <span class="va">agg_vals</span>)
+        <span class="kw">if</span> <span class="fn">len</span>(<span class="va">buf</span>) <span class="op">&gt;=</span> <span class="va">_BATCH_SIZE</span>:
+            <span class="kw">yield</span> <span class="va">buf</span>
+            <span class="va">buf</span> <span class="op">=</span> []
+    <span class="kw">if</span> <span class="va">buf</span>:
+        <span class="kw">yield</span> <span class="va">buf</span></code></pre>
+
+<p>
+Each output row is <code>key + agg_vals</code> — the group-by columns
+followed by the aggregation results. For
+<code>group_by("region").agg(col("amount").sum().alias("total"))</code>,
+you'd get rows like <code>("EU", 430)</code> and <code>("US", 320)</code>.
+</p>
+
+<p>
+<code>df.group_by("region").agg(col("amount").sum().alias("total"))</code>
+builds an <code>AggNode</code> with group key <code>["region"]</code> and a
+<code>sum</code> over <code>col("amount")</code>. The running-accumulator
+algorithm processes every row exactly once, maintaining one integer per group.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 4.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Lesson 4.4</span>
+  The Sorted Alternative — O(1) Memory
+</h2>
+
+<p>
+Hash joins and hash aggregations are fast and general-purpose. But they
+come with a cost: the hash table. For joins, the entire right side lives
+in memory. For aggregations, all group accumulators live in memory. When
+the data is large and the groups are many, that memory pressure adds up.
+</p>
+
+<p>
+There's an alternative — but it requires a <strong>precondition</strong>:
+the data must be <em>sorted</em> by the key columns. When that's true,
+something remarkable happens: both joins and aggregations can run in
+<strong>constant memory</strong>.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The tradeoff</div>
+  Sorted algorithms trade generality for memory efficiency. Hash-based
+  algorithms work on any data in any order. Sorted algorithms require
+  pre-sorted input — and if your data isn't already sorted, the sort
+  itself costs O(n log n) time and O(n) memory, which may negate the
+  savings. The win comes when your data is <em>naturally</em> sorted
+  (e.g., a time-series log file) or when you've already sorted it for
+  another reason.
+</div>
+
+<h3>Sorted aggregation — one group at a time</h3>
+
+<p>
+When rows are sorted by the group key, all rows belonging to the same
+group appear in a <em>contiguous run</em>. You don't need a hash table —
+you just watch for the key to change:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Sorted streaming aggregation</div>
+<pre><code><span class="kw">def</span> <span class="fn">sorted_group_by_sum</span>(<span class="va">sorted_rows</span>, <span class="va">key_col</span>, <span class="va">val_col</span>):
+    <span class="va">prev_key</span> <span class="op">=</span> <span class="kw">None</span>
+    <span class="va">running_sum</span> <span class="op">=</span> <span class="nu">0</span>
+
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">sorted_rows</span>:
+        <span class="va">key</span> <span class="op">=</span> <span class="va">row</span>[<span class="va">key_col</span>]
+        <span class="kw">if</span> <span class="va">key</span> <span class="op">!=</span> <span class="va">prev_key</span>:
+            <span class="kw">if</span> <span class="va">prev_key</span> <span class="kw">is not</span> <span class="kw">None</span>:
+                <span class="kw">yield</span> (<span class="va">prev_key</span>, <span class="va">running_sum</span>)
+            <span class="va">prev_key</span> <span class="op">=</span> <span class="va">key</span>
+            <span class="va">running_sum</span> <span class="op">=</span> <span class="nu">0</span>
+        <span class="va">running_sum</span> <span class="op">+=</span> <span class="va">row</span>[<span class="va">val_col</span>]
+
+    <span class="kw">if</span> <span class="va">prev_key</span> <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="kw">yield</span> (<span class="va">prev_key</span>, <span class="va">running_sum</span>)</code></pre>
+
+<p>
+Only <strong>one accumulator</strong> is alive at any time. When the key
+changes, the current group is finalized and emitted, and a fresh
+accumulator is created for the next group. Memory usage: O(1).
+</p>
+
+<p>
+Python's <code>itertools.groupby</code> encapsulates this exact pattern.
+It groups consecutive elements with the same key — but it has a
+critical gotcha:
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">itertools.groupby requires sorted input</div>
+  Unlike SQL's <code>GROUP BY</code>, Python's <code>itertools.groupby</code>
+  only groups <em>adjacent</em> elements with the same key. If your data is
+  <code>[A, A, B, A]</code>, you'll get three groups: <code>[A, A]</code>,
+  <code>[B]</code>, and <code>[A]</code> — not two. This is exactly right
+  for <code>SortedAggNode</code> — its input is guaranteed sorted. The
+  danger is using <code>groupby</code> on unsorted data elsewhere.
+</div>
+
+<p>
+pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" class="source-link" target="_blank" rel="noopener"><code>SortedAggNode</code></a> uses <code>groupby</code> directly,
+trusting that its input is sorted:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> SortedAggNode.execute_batched (plan.py)</div>
+<pre><code><span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> Iterator[<span class="bi">list</span>[<span class="bi">tuple</span>]]:
+    <span class="va">col_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(
+        <span class="va">self</span>.child.schema().column_names)}
+    <span class="va">g_idx</span> <span class="op">=</span> [<span class="va">col_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>.group_by]
+    <span class="va">key_func</span> <span class="op">=</span> <span class="fn">_make_key_fn</span>(<span class="va">g_idx</span>)
+
+    <span class="va">compiled_evals</span> <span class="op">=</span> [<span class="va">a</span>.expr.compile(<span class="va">col_map</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+    <span class="va">updaters</span> <span class="op">=</span> [<span class="fn">_make_updater</span>(<span class="va">a</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+
+    <span class="va">buf</span>: <span class="bi">list</span> <span class="op">=</span> []
+    <span class="kw">for</span> <span class="va">key</span>, <span class="va">group_rows</span> <span class="kw">in</span> <span class="fn">groupby</span>(<span class="va">self</span>.child.execute(), key<span class="op">=</span><span class="va">key_func</span>):
+        <span class="va">accs</span> <span class="op">=</span> [<span class="fn">_init_acc</span>(<span class="va">a</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">self</span>.agg_exprs]
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">group_rows</span>:
+            <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="fn">len</span>(<span class="va">self</span>.agg_exprs)):
+                <span class="va">updaters</span>[<span class="va">i</span>](<span class="va">accs</span>[<span class="va">i</span>], <span class="va">compiled_evals</span>[<span class="va">i</span>](<span class="va">row</span>))
+        <span class="va">buf</span>.append(
+            <span class="va">key</span> <span class="op">+</span> <span class="fn">tuple</span>(<span class="fn">_finalize_acc</span>(<span class="va">accs</span>[<span class="va">i</span>], <span class="va">self</span>.agg_exprs[<span class="va">i</span>])
+                        <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="fn">len</span>(<span class="va">self</span>.agg_exprs))))
+        <span class="kw">if</span> <span class="fn">len</span>(<span class="va">buf</span>) <span class="op">&gt;=</span> <span class="va">_BATCH_SIZE</span>:
+            <span class="kw">yield</span> <span class="va">buf</span>
+            <span class="va">buf</span> <span class="op">=</span> []
+    <span class="kw">if</span> <span class="va">buf</span>:
+        <span class="kw">yield</span> <span class="va">buf</span></code></pre>
+
+<p>
+The structure mirrors <code>AggNode</code> almost exactly — same
+<code>_init_acc</code>, same <code>_make_updater</code>, same
+<code>_finalize_acc</code>. The only difference is
+<strong>where the grouping happens</strong>. <code>AggNode</code> uses a
+hash table (<code>accumulators</code> dict). <code>SortedAggNode</code>
+uses <code>itertools.groupby</code>, which detects groups by watching for
+key changes in sorted input. The accumulator logic is identical.
+</p>
+
+<h3>Sorted merge join — two cursors</h3>
+
+<p>
+The same principle applies to joins. When both sides are sorted by their
+join key, you don't need a hash table. Instead, you advance two cursors
+in lockstep:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Sort-merge join — the core idea</div>
+<pre><code><span class="cm"># Both inputs sorted by join key</span>
+<span class="va">left_cursor</span>  <span class="op">=</span> <span class="fn">next</span>(<span class="va">left_iter</span>)
+<span class="va">right_cursor</span> <span class="op">=</span> <span class="fn">next</span>(<span class="va">right_iter</span>)
+
+<span class="kw">while</span> <span class="va">both_active</span>:
+    <span class="kw">if</span> <span class="va">left_key</span> <span class="op">&lt;</span> <span class="va">right_key</span>:
+        advance_left()    <span class="cm"># left row has no match</span>
+    <span class="kw">elif</span> <span class="va">left_key</span> <span class="op">&gt;</span> <span class="va">right_key</span>:
+        advance_right()   <span class="cm"># right row has no match</span>
+    <span class="kw">else</span>:
+        <span class="cm"># Keys match! Emit cross product of matching groups</span>
+        emit_matches()</code></pre>
+
+<p>
+Because the data is sorted, the cursor that's behind always advances.
+When the cursors land on equal keys, the rows match and get emitted.
+Memory usage is O(1) for one-to-one joins. For many-to-many matches
+(multiple rows with the same key on both sides), it briefly collects the
+matching group to compute the cross product — that's O(g) where g is
+the group size.
+</p>
+
+<p>
+pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedMergeJoinNode" class="source-link" target="_blank" rel="noopener"><code>SortedMergeJoinNode</code></a> implements this algorithm in
+full, with support for inner, left, and full join modes. The code is the
+longest in the plan module (~80 lines) because it needs to handle all
+the edge cases: exhausted iterators, mismatched keys at the boundaries,
+and unmatched rows for outer joins. We won't reproduce all of it here,
+but here's the critical matching section:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> SortedMergeJoinNode — matching keys (plan.py, abridged)</div>
+<pre><code><span class="kw">else</span>:  <span class="cm"># lk == rk — keys match</span>
+    <span class="va">match_key</span> <span class="op">=</span> <span class="va">lk</span>
+    <span class="va">left_group</span> <span class="op">=</span> [<span class="va">l_row</span>]
+    <span class="va">right_group</span> <span class="op">=</span> [<span class="va">r_row</span>]
+
+    <span class="cm"># Collect all left rows with this key</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="kw">try</span>:
+            <span class="va">l_row</span> <span class="op">=</span> <span class="fn">next</span>(<span class="va">left_iter</span>)
+            <span class="kw">if</span> <span class="fn">l_key</span>(<span class="va">l_row</span>) <span class="op">==</span> <span class="va">match_key</span>:
+                <span class="va">left_group</span>.append(<span class="va">l_row</span>)
+            <span class="kw">else</span>: <span class="kw">break</span>
+        <span class="kw">except</span> <span class="cl">StopIteration</span>:
+            <span class="va">l_exhausted</span> <span class="op">=</span> <span class="kw">True</span>; <span class="kw">break</span>
+
+    <span class="cm"># Same for right side... then cross product:</span>
+    <span class="kw">for</span> <span class="va">lr</span> <span class="kw">in</span> <span class="va">left_group</span>:
+        <span class="kw">for</span> <span class="va">rr</span> <span class="kw">in</span> <span class="va">right_group</span>:
+            <span class="kw">yield</span> <span class="va">lr</span> <span class="op">+</span> <span class="va">rr</span></code></pre>
+
+<p>
+When keys match, both cursors advance to collect all rows sharing that
+key. Then the cross product is emitted. After that, the cursors resume
+their lockstep advance from where they left off.
+</p>
+
+<h3>Choosing the right algorithm</h3>
+
+<p>
+pyfloe exposes both strategies through a single <code>sorted</code>
+parameter:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> The API — one parameter, two algorithms</div>
+<pre><code><span class="cm"># Hash join (default) — works on any data</span>
+<span class="va">orders</span>.join(<span class="va">customers</span>, on<span class="op">=</span><span class="st">"customer_id"</span>)
+
+<span class="cm"># Sort-merge join — O(1) memory for pre-sorted input</span>
+<span class="va">orders</span>.sort(<span class="st">"id"</span>).join(
+    <span class="va">customers</span>.sort(<span class="st">"id"</span>), on<span class="op">=</span><span class="st">"id"</span>, sorted<span class="op">=</span><span class="kw">True</span>)
+
+<span class="cm"># Hash aggregation (default)</span>
+<span class="va">df</span>.group_by(<span class="st">"region"</span>).agg(col(<span class="st">"amount"</span>).sum())
+
+<span class="cm"># Sorted streaming aggregation — O(1) memory per group</span>
+<span class="va">df</span>.sort(<span class="st">"region"</span>).group_by(
+    <span class="st">"region"</span>, sorted<span class="op">=</span><span class="kw">True</span>).agg(col(<span class="st">"amount"</span>).sum())</code></pre>
+
+<table class="complexity-table">
+  <thead>
+    <tr>
+      <th></th>
+      <th>Hash-based</th>
+      <th>Sorted</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Join time</strong></td>
+      <td>O(n + m)</td>
+      <td>O(n + m) if pre-sorted</td>
+    </tr>
+    <tr>
+      <td><strong>Join memory</strong></td>
+      <td>O(m) right side</td>
+      <td><strong>O(1)</strong> base</td>
+    </tr>
+    <tr>
+      <td><strong>Agg time</strong></td>
+      <td>O(n)</td>
+      <td>O(n)</td>
+    </tr>
+    <tr>
+      <td><strong>Agg memory</strong></td>
+      <td>O(k) groups</td>
+      <td><strong>O(1)</strong></td>
+    </tr>
+    <tr>
+      <td><strong>Best when</strong></td>
+      <td>Unsorted data, small right side</td>
+      <td>Pre-sorted data, streaming pipelines</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="aside callout-teal">
+  <div class="aside-title">In the wild</div>
+  For a streaming pipeline like
+  <code>read_csv("sorted_log.csv").join(lookup, on="key", sorted=True).to_csv(...)</code>,
+  the sort-merge join never materializes either side. Rows flow from the
+  CSV reader through the join and out to the writer with constant memory —
+  no matter whether the file is 1 MB or 100 GB. This is the same technique
+  that makes Spark's sort-merge join viable on datasets larger than RAM.
+</div>
+
+<details class="deep-dive">
+  <summary>Deep dive: Why does pyfloe keep both algorithms?</summary>
+  <div class="deep-dive-body">
+    <p>
+      You might wonder: if sorted algorithms use less memory, why not always
+      sort first and then use them? Because sorting itself costs O(n log n)
+      time and O(n) memory. If your data isn't already sorted, the sort
+      negates the memory savings of the sorted join or aggregation.
+    </p>
+    <p>
+      The hash-based algorithms are the right <em>default</em> — they work
+      on any data with no preconditions. The sorted algorithms are a
+      <em>specialization</em> for when the data happens to be sorted
+      already (common with time-series data, log files, and pre-sorted
+      exports).
+    </p>
+    <p>
+      A cost-based optimizer (like the ones in PostgreSQL or Spark) would
+      choose automatically based on statistics — estimated row counts,
+      key cardinality, available memory. pyfloe's rule-based optimizer
+      doesn't make this choice, so it's left to the user via the
+      <code>sorted=True</code> parameter. This is a deliberate design
+      tradeoff: simplicity over automation.
+    </p>
+  </div>
+</details>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- TWO TREES REMINDER -->
+<!-- ============================================================ -->
+
+<h3>The two trees — where we stand</h3>
+
+<p>
+Before we wrap up, let's ground what we've built in the architecture.
+Remember the two trees from earlier modules:
+</p>
+
+<p>
+The <strong>Plan Tree</strong> describes how data flows. After this module,
+we have a much richer vocabulary of plan nodes: <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> →
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> → <code>JoinNode</code> → <code>AggNode</code> →
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a>. Joins are the first nodes with <em>two</em>
+children (left and right inputs), turning the plan from a simple chain
+into a real tree.
+</p>
+
+<p>
+The <strong>Expression Tree</strong> (from Module 2) lives <em>inside</em>
+plan nodes. The <code>AggNode</code> is the clearest example: each
+aggregation expression (<code>col("amount").sum()</code>) is an expression
+tree node of type <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20AggExpr" class="source-link" target="_blank" rel="noopener"><code>AggExpr</code></a>. The node's <code>compile()</code>
+method turns it into a fast callable; the <code>agg_name</code> attribute
+selects the right accumulator. Expressions are the <em>what to compute</em>;
+plan nodes are the <em>how to flow data</em>.
+</p>
+
+<p>
+These two trees will fully converge in Module 5, where the Optimizer walks
+the plan tree, inspects the expressions inside each node, and rewrites
+the whole structure for efficiency.
+</p>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2>Exercises</h2>
+
+<p>
+Test your understanding of the algorithms we've built.
+</p>
+
+<div class="interactive-box" id="quiz-container">
+  <h4>Quick check</h4>
+
+  <div id="quiz">
+    <div id="q1" class="quiz-question">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        1. A hash join has two phases. Which side is used for the "build" phase?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">The left (larger) side</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, true)">The right (smaller) side</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">Both sides simultaneously</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">Whichever has more columns</button>
+      </div>
+      <div id="feedback-1" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q2" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        2. What's the time complexity of a nested-loop join on tables of size n and m?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">O(n + m)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, true)">O(n × m)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">O(n log m)</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">O(n)</button>
+      </div>
+      <div id="feedback-2" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q3" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        3. Why does hash aggregation use running accumulators instead of storing all values?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">It's faster to compute</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, true)">Memory drops from O(n) to O(k) groups</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">It's simpler to implement</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">Python dicts require it</button>
+      </div>
+      <div id="feedback-3" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q4" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        4. What's the critical gotcha with <code>itertools.groupby</code>?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It doesn't handle None values</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It's slower than a dict</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, true)">It only groups <em>adjacent</em> equal elements</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It returns lists, not iterators</button>
+      </div>
+      <div id="feedback-4" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q5" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        5. In a full join, what does <code>matched_keys</code> track?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">All keys in the left table</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Keys that appear in both tables</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, true)">Right-side keys that found a left match</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Keys that were null-padded</button>
+      </div>
+      <div id="feedback-5" class="output-box" style="display: none;"></div>
+    </div>
+  </div>
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- SIDE QUEST CALLOUT -->
+<!-- ============================================================ -->
+
+<div class="side-quest-callout">
+  <div class="side-quest-header">
+    <span class="side-quest-icon">&#9671;</span>
+    <span class="side-quest-label">Side Quest</span>
+  </div>
+  <div class="side-quest-title">Wiring It Together</div>
+  <p class="side-quest-desc">
+    Before diving into the optimizer, take a detour and wire everything
+    you've built — scan, filter, join, aggregate — into a complete
+    mini-pipeline you can run end to end.
+  </p>
+  <a href="/interlude-wiring/" class="side-quest-link">Take the side quest &rarr;</a>
+</div>
+
+<!-- ============================================================ -->
+<!-- CLIFFHANGER -->
+<!-- ============================================================ -->
+
+<div class="aside callout-purple">
+  <div class="aside-title">Coming next</div>
+  We've built a complete, working query engine. It can scan, filter,
+  project, compute, join, and aggregate — all lazily, all in batches.
+  But is it <em>smart</em>? Right now, if you filter after a join, the
+  engine dutifully joins <strong>all</strong> the data and <em>then</em>
+  throws most of it away. A smart engine would push the filter down
+  <em>before</em> the join. It would also notice that you're only using
+  3 columns out of 20, and stop carrying the other 17 through every node.
+  That's what an optimizer does — and that's where this entire course has
+  been heading.
+</div>
+
+<div class="source-references">
+  <h3>Source References</h3>
+  <p>Browse the pyfloe source code for the classes and functions covered in this module.</p>
+  <div class="ref-group">
+    <h4>plan.py — Plan Nodes</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener"><code>JoinNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" target="_blank" rel="noopener"><code>AggNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" target="_blank" rel="noopener"><code>SortedAggNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedMergeJoinNode" target="_blank" rel="noopener"><code>SortedMergeJoinNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+    </ul>
+  </div>
+  <div class="ref-group">
+    <h4>expr.py — Expression AST</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20AggExpr" target="_blank" rel="noopener"><code>AggExpr</code></a></li>
+    </ul>
+  </div>
+  <div class="ref-group">
+    <h4>io.py — File I/O</h4>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_csv" target="_blank" rel="noopener"><code>read_csv()</code></a></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const answers = {
+  1: {
+    correct: "Exactly. The hash table is built from the right (typically smaller) side, then the left (larger) side streams through probing it. This minimizes memory usage because only the smaller side needs to be materialized. pyfloe, Spark, and Polars all follow this convention.",
+    wrong: "Not quite. The hash table is built from the right side — by convention, the smaller table. The left (larger) side then streams through, probing the hash table for matches. This way, only the smaller table is materialized in memory."
+  },
+  2: {
+    correct: "Right. For every row in the left table, you scan the entire right table — n × m comparisons total. With 1M orders and 100K customers, that's 100 billion comparisons. A hash join brings this down to O(n + m) by replacing the inner scan with an O(1) hash lookup.",
+    wrong: "Not quite. A nested loop checks every left row against every right row — that's n × m comparisons. It's the simplest algorithm, but also the slowest. Hash joins improve this to O(n + m)."
+  },
+  3: {
+    correct: "Yes. A naive approach that stores all values uses O(n) memory — proportional to total rows. Running accumulators store only the state needed per group (a running sum, a count, etc.), so memory is O(k) where k is the number of groups. For 10M rows across 50 regions, that's the difference between megabytes and a few hundred bytes.",
+    wrong: "Not quite. The key advantage is memory. Storing all values consumes O(n) memory. Running accumulators — a single integer for sum, a sum+count for mean — use only O(k) memory, where k is the number of groups. Most aggregations (sum, count, min, max, mean) can be computed with a tiny fixed-size accumulator."
+  },
+  4: {
+    correct: "Exactly. itertools.groupby only groups consecutive elements with the same key. If your data is [A, A, B, A], you get three groups: [A, A], [B], [A] — not two. The input must be sorted by the key first. This makes it perfect for SortedAggNode but dangerous if you forget the precondition.",
+    wrong: "Not quite. The critical gotcha is that itertools.groupby only groups adjacent equal elements — it doesn't collect all matching elements across the whole sequence. Input must be sorted by the group key for correct results. This is by design: it's a streaming operation that uses O(1) memory."
+  },
+  5: {
+    correct: "Right. During the probe phase, every right-side key that matches a left row gets added to matched_keys. After the probe, the full join needs to emit right-side rows that had NO match. It iterates the hash table and emits any key NOT in matched_keys, padded with null_left. This is the only place the hash table is traversed twice.",
+    wrong: "Not quite. matched_keys tracks which right-side keys were matched during the probe phase. After processing all left rows, a full join needs to emit unmatched right rows — it iterates the hash table and emits any key not in matched_keys, padded with nulls on the left side."
+  }
+};
+
+function checkAnswer(q, btn, correct) {
+  const feedback = document.getElementById('feedback-' + q);
+  const btns = btn.parentElement.querySelectorAll('.quiz-btn');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+  btn.style.opacity = '1';
+
+  if (correct) {
+    btn.style.borderColor = '#0F6E56';
+    btn.style.background = '#E1F5EE';
+    btn.style.color = '#0F6E56';
+    feedback.className = 'output-box';
+    feedback.textContent = answers[q].correct;
+  } else {
+    btn.style.borderColor = '#A32D2D';
+    btn.style.background = '#FCEBEB';
+    btn.style.color = '#A32D2D';
+    feedback.className = 'output-box error';
+    feedback.textContent = answers[q].wrong;
+  }
+  feedback.style.display = 'block';
+}
+</script>

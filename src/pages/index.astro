@@ -1,0 +1,8 @@
+---
+import LandingLayout from '../layouts/LandingLayout.astro';
+import html from '../content/index.html?raw';
+---
+
+<LandingLayout title="Build Your Own DataFrame">
+  <Fragment set:html={html} />
+</LandingLayout>

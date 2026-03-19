@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/module-3.html?raw';
+---
+
+<CourseLayout title="The Engine Room — Plan Nodes & Batched Execution" activeSlug="module-3" moduleBadge="Module 3 of 5">
+  <Fragment set:html={html} />
+</CourseLayout>

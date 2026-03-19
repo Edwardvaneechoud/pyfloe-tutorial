@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/module-4.html?raw';
+---
+
+<CourseLayout title="Advanced Algorithms — Hashing, Grouping & Joins" activeSlug="module-4" moduleBadge="Module 4 of 5">
+  <Fragment set:html={html} />
+</CourseLayout>

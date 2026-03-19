@@ -1,0 +1,803 @@
+<h1>Wiring It All <em>Together</em></h1>
+
+<p class="subtitle">
+You've spent four modules building the parts: expressions, plan nodes, batched
+execution, hash joins, aggregation. Now it's time to step back, wire
+everything into a real pipeline, and watch the engine run end to end.
+</p>
+
+<p>
+This isn't a new module. No new concepts. Think of it as a pit stop — a
+chance to see the machine you've built actually work, to read the plan tree it
+produces, and to notice, with fresh eyes, the <em>waste</em> that our
+engine doesn't yet know how to avoid. That waste is what motivates
+Module 5.
+</p>
+
+<nav class="toc">
+  <div class="toc-title">In this interlude</div>
+  <a class="toc-item" href="#section-1"><span class="toc-num">I.1</span> Building a Real Pipeline</a>
+  <a class="toc-item" href="#section-2"><span class="toc-num">I.2</span> Reading the Explain Plan</a>
+  <a class="toc-item" href="#section-3"><span class="toc-num">I.3</span> Spotting the Waste</a>
+  <a class="toc-item" href="#section-4"><span class="toc-num">I.4</span> Our Engine vs. Polars — A Side-by-Side</a>
+  <a class="toc-item" href="#exercises"><span class="toc-num">✎</span> Exercises</a>
+</nav>
+
+
+<!-- ============================================================ -->
+<!-- PARTS INVENTORY -->
+<!-- ============================================================ -->
+
+<h3>A quick inventory</h3>
+
+<p>
+Before we wire anything together, let's take stock. Across four modules,
+you've built or studied every piece of this system:
+</p>
+
+<div class="inventory-grid">
+  <div class="inventory-item">
+    <div class="icon">📄</div>
+    <div class="name">ScanNode</div>
+    <div class="source">Module 1</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">🔍</div>
+    <div class="name">FilterNode</div>
+    <div class="source">Modules 1 &amp; 3</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">📐</div>
+    <div class="name">ProjectNode</div>
+    <div class="source">Module 3</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">➕</div>
+    <div class="name">WithColumnNode</div>
+    <div class="source">Module 3</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">🔗</div>
+    <div class="name">JoinNode</div>
+    <div class="source">Module 4</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">📊</div>
+    <div class="name">AggNode</div>
+    <div class="source">Module 4</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">🌳</div>
+    <div class="name">Expression AST</div>
+    <div class="source">Module 2</div>
+  </div>
+  <div class="inventory-item">
+    <div class="icon">🏷️</div>
+    <div class="name">LazySchema</div>
+    <div class="source">Module 3</div>
+  </div>
+</div>
+
+<p>
+Individually, you understand each piece. The question now is: what
+happens when they all work together?
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- SECTION I.1: BUILDING A REAL PIPELINE -->
+<!-- ============================================================ -->
+
+<h2 id="section-1">
+  <span class="lesson-num">Section I.1</span>
+  Building a Real Pipeline
+</h2>
+
+<p>
+Let's build something realistic. Imagine an e-commerce company with two
+tables: <strong>orders</strong> (what customers bought) and
+<strong>customers</strong> (who they are). We want to answer a simple
+business question: <em>"For each region, what's the total revenue from
+orders over $100?"</em>
+</p>
+
+<p>
+Here's the data. It's small enough to fit in your head — that's deliberate.
+The point isn't volume; it's watching the pipeline run.
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Our data — using pyfloe's real API</div>
+<pre data-executable data-label="The full pipeline — live"><code>import pyfloe as pf
+
+orders = pf.LazyFrame([
+    {"order_id": 1, "customer_id": 101, "amount": 250.0, "product": "Widget A"},
+    {"order_id": 2, "customer_id": 102, "amount": 45.0,  "product": "Widget B"},
+    {"order_id": 3, "customer_id": 103, "amount": 180.0, "product": "Widget C"},
+    {"order_id": 4, "customer_id": 101, "amount": 320.0, "product": "Widget D"},
+    {"order_id": 5, "customer_id": 104, "amount": 90.0,  "product": "Widget A"},
+    {"order_id": 6, "customer_id": 102, "amount": 150.0, "product": "Widget E"},
+])
+
+customers = pf.LazyFrame([
+    {"customer_id": 101, "name": "Alice",  "region": "EU", "segment": "Enterprise"},
+    {"customer_id": 102, "name": "Bob",    "region": "US", "segment": "SMB"},
+    {"customer_id": 103, "name": "Carlos", "region": "EU", "segment": "Enterprise"},
+    {"customer_id": 104, "name": "Diana",  "region": "US", "segment": "Enterprise"},
+])
+
+# Build the pipeline — each call adds a plan node
+result = (
+    orders
+    .join(customers, on="customer_id")
+    .filter(pf.col("amount") > 100)
+    .with_column("tax", pf.col("amount") * 0.2)
+    .select("region", "amount", "tax")
+)
+
+# Check schema BEFORE running (lazy!)
+print("Schema:", result.schema)
+print()
+
+# Now materialize
+result.collect()
+for row in result.to_pylist():
+    print(row)</code></pre>
+
+<p>
+Nothing has happened yet. Both <code>orders</code> and <code>customers</code>
+are <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> objects wrapping <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> instances.
+No data has been processed. No rows have been touched. This is the "lazy"
+in lazy evaluation.
+</p>
+
+<p>
+Now let's build the pipeline — each method call adds a node to the plan
+tree:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> The full pipeline</div>
+<pre><code>result <span class="op">=</span> (
+    orders
+    .join(customers, on<span class="op">=</span><span class="st">"customer_id"</span>)          <span class="cm"># JoinNode</span>
+    .filter(pf.col(<span class="st">"amount"</span>) <span class="op">></span> <span class="nu">100</span>)              <span class="cm"># FilterNode</span>
+    .with_column(<span class="st">"tax"</span>, pf.col(<span class="st">"amount"</span>) <span class="op">*</span> <span class="nu">0.2</span>)  <span class="cm"># WithColumnNode</span>
+    .select(<span class="st">"region"</span>, <span class="st">"amount"</span>, <span class="st">"tax"</span>)         <span class="cm"># ProjectNode</span>
+)</code></pre>
+
+<p>
+Four method calls. Four plan nodes created. Zero rows processed. The variable
+<code>result</code> is a <code>LazyFrame</code> that holds the <em>plan</em>
+for a computation, not the result of one.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Notice</div>
+  Each method call — <code>.join()</code>, <code>.filter()</code>,
+  <code>.with_column()</code>, <code>.select()</code> — creates a new plan
+  node and wraps it in a new <code>LazyFrame</code>. The original
+  <code>orders</code> and <code>customers</code> frames are untouched. This
+  is the <code>_from_plan</code> classmethod from Module 3 in action.
+</div>
+
+<p>
+We can even query the output schema <em>before</em> running anything:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Schema — known instantly</div>
+<pre><code>result.schema
+<span class="cm"># Schema(</span>
+<span class="cm">#   region: str</span>
+<span class="cm">#   amount: float</span>
+<span class="cm">#   tax: float</span>
+<span class="cm"># )</span>
+
+result.is_materialized   <span class="cm"># False</span></code></pre>
+
+<p>
+Three columns, all typed, no data touched. Each node's <code>.schema()</code>
+method propagated types from the leaves to the root — exactly the
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" class="source-link" target="_blank" rel="noopener"><code>LazySchema</code></a> machinery from Module 3, Lesson 3.5.
+</p>
+
+<p>
+Now let's pull the trigger:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Materialise with .collect()</div>
+<pre><code>result.collect()
+result.to_pylist()
+<span class="cm"># [</span>
+<span class="cm">#   {'region': 'EU', 'amount': 250.0, 'tax': 50.0},</span>
+<span class="cm">#   {'region': 'EU', 'amount': 180.0, 'tax': 36.0},</span>
+<span class="cm">#   {'region': 'EU', 'amount': 320.0, 'tax': 64.0},</span>
+<span class="cm">#   {'region': 'US', 'amount': 150.0, 'tax': 30.0},</span>
+<span class="cm"># ]</span></code></pre>
+
+<p>
+That's the complete lifecycle: build the plan lazily, inspect the schema
+instantly, materialise when you need the data. The order of execution was
+not top-to-bottom through the code — it was bottom-to-top through the
+<em>plan tree</em>. <code>.collect()</code> called
+<code>ProjectNode.execute_batched()</code>, which pulled from
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" class="source-link" target="_blank" rel="noopener"><code>WithColumnNode</code></a>, which pulled from <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a>,
+which pulled from <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a>, which pulled from the two
+<code>ScanNode</code> leaves. The volcano model, exactly as we built it.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- SECTION I.2: READING THE EXPLAIN PLAN -->
+<!-- ============================================================ -->
+
+<h2 id="section-2">
+  <span class="lesson-num">Section I.2</span>
+  Reading the Explain Plan
+</h2>
+
+<p>
+Every <code>LazyFrame</code> has an <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20explain" class="source-link" target="_blank" rel="noopener"><code>.explain()</code></a> method that
+prints the plan tree as an indented string. Each line is one node; each
+level of indentation is one layer deeper in the tree. Let's look at
+what our pipeline produced:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's .explain() output</div>
+<pre><code><span class="fn">print</span>(result.explain())
+<span class="cm"># Project [region, amount, tax]</span>
+<span class="cm">#   WithColumn [tax = (col("amount") * 0.2)]</span>
+<span class="cm">#     Filter [(col("amount") > 100)]</span>
+<span class="cm">#       Join [inner] ['customer_id'] = ['customer_id']</span>
+<span class="cm">#         Scan [order_id, customer_id, amount, product] (6 rows)</span>
+<span class="cm">#         Scan [customer_id, name, region, segment] (4 rows)</span></code></pre>
+
+<p>
+Read it from the bottom up — that's the direction data flows.
+Let's walk through every line:
+</p>
+
+<div class="plan-annotation">
+<span class="node">Project [region, amount, tax]</span>              <span class="arrow">← root: keep only 3 columns</span>
+  <span class="node">WithColumn [tax = (col("amount") * 0.2)]</span> <span class="arrow">← compute tax per row</span>
+    <span class="node">Filter [(col("amount") > 100)]</span>           <span class="arrow">← discard rows ≤ 100</span>
+      <span class="node">Join [inner] ['customer_id'] = …</span>      <span class="arrow">← hash join on customer_id</span>
+        <span class="node">Scan [order_id, customer_id, …]</span>    <span class="arrow">← left: 6 order rows</span>
+        <span class="node">Scan [customer_id, name, …]</span>        <span class="arrow">← right: 4 customer rows</span>
+</div>
+
+<p>
+The two <code>ScanNode</code> leaves are the data sources. The
+<code>JoinNode</code> is the first node with <em>two</em> children —
+this is where the plan becomes a true tree rather than a simple chain.
+Above the join, every node has one child, forming a linear stack: filter,
+then compute, then project.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Key insight</div>
+  The <code>explain()</code> output is produced by the recursive
+  <code>PlanNode.explain()</code> method you saw in Module 3. Each node
+  calls <code>_explain_self()</code> for its own line, then calls
+  <code>.explain(indent + 1)</code> on each child. The indentation
+  <em>is</em> the tree structure.
+</div>
+
+<h3>Connecting it to the volcano model</h3>
+
+<p>
+When <code>.collect()</code> runs, execution starts at the <em>top</em>
+of this tree and pulls downward. The <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a> asks its
+child (the <code>WithColumnNode</code>) for a batch. The
+<code>WithColumnNode</code> asks the <code>FilterNode</code>. The
+<code>FilterNode</code> asks the <code>JoinNode</code>. The
+<code>JoinNode</code> asks both <code>ScanNode</code> leaves. Rows
+ripple up through the tree in batches of 1,024.
+</p>
+
+<p>
+The plan is a <em>recipe</em>. The volcano model is the <em>kitchen</em>
+that executes the recipe. And <code>.explain()</code> is the recipe card
+you can read before anything starts cooking.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- SECTION I.3: SPOTTING THE WASTE -->
+<!-- ============================================================ -->
+
+<h2 id="section-3">
+  <span class="lesson-num">Section I.3</span>
+  Spotting the Waste
+</h2>
+
+<p>
+Our engine is <em>correct</em>. It produces the right answer. But look
+at the plan again — really look at it — and ask: is it doing unnecessary
+work?
+</p>
+
+<h3>Waste #1: The filter is too late</h3>
+
+<p>
+Look at where the <code>FilterNode</code> sits in the plan:
+</p>
+
+<div class="plan-annotation">
+Project [region, amount, tax]
+  WithColumn [tax = (col("amount") * 0.2)]
+    <span class="waste">Filter [(col("amount") > 100)]            ← HERE</span>
+      Join [inner] ['customer_id'] = ['customer_id']
+        Scan [order_id, customer_id, amount, product] (6 rows)
+        Scan [customer_id, name, region, segment] (4 rows)
+</div>
+
+<p>
+The filter sits <em>above</em> the join. That means the join processes
+<strong>all 6 orders</strong> — including order #2 ($45) and order #5
+($90), which will be thrown away immediately afterward. With our tiny
+dataset, that's 2 wasted rows. With 10 million orders, it's potentially
+millions of wasted join probes.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The problem</div>
+  The filter expression <code>pf.col("amount") > 100</code> only depends
+  on the <code>amount</code> column, which comes from the <code>orders</code>
+  table. It doesn't need anything from <code>customers</code>. So
+  there's no reason the filter <em>must</em> wait until after the join.
+  It <em>could</em> run on the orders table directly, before any joining
+  happens — reducing the input from 6 rows to 4.
+</div>
+
+<p>
+What would a smarter plan look like?
+</p>
+
+<div class="plan-annotation">
+Project [region, amount, tax]
+  WithColumn [tax = (col("amount") * 0.2)]
+    Join [inner] ['customer_id'] = ['customer_id']
+      <span class="good">Filter [(col("amount") > 100)]          ← PUSHED DOWN</span>
+        Scan [order_id, customer_id, amount, product] (6 rows)
+      Scan [customer_id, name, region, segment] (4 rows)
+</div>
+
+<p>
+Same result. Fewer rows entering the join. This transformation has a name:
+<strong class="highlight">filter pushdown</strong>.
+</p>
+
+<h3>Waste #2: Too many columns</h3>
+
+<p>
+Look at the <code>ScanNode</code> for orders. It reads four columns:
+<code>order_id</code>, <code>customer_id</code>, <code>amount</code>,
+and <code>product</code>.
+</p>
+
+<p>
+Now look at the final <code>ProjectNode</code>: it keeps only
+<code>region</code>, <code>amount</code>, and <code>tax</code>. The
+<code>order_id</code> column is never used by any node in the plan.
+The <code>product</code> column is never used either. And from the
+customers table, <code>name</code> and <code>segment</code> are carried
+through the entire join only to be discarded at the end.
+</p>
+
+<div class="plan-annotation">
+Project [region, amount, tax]
+  WithColumn [tax = (col("amount") * 0.2)]
+    Filter [(col("amount") > 100)]
+      Join [inner] ['customer_id'] = ['customer_id']
+        Scan [<span class="waste">order_id</span>, customer_id, amount, <span class="waste">product</span>] (6 rows)
+        Scan [customer_id, <span class="waste">name</span>, region, <span class="waste">segment</span>] (4 rows)
+</div>
+
+<p>
+Four columns (highlighted in red) are read from the data sources, carried
+through the join as extra elements in every tuple, passed through the
+filter and the with-column computation, and only then dropped by the
+project at the very top. Every one of those columns consumed memory in
+the hash table, occupied a slot in every tuple, and was copied across
+batch boundaries — for nothing.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The problem</div>
+  The engine doesn't know which columns are needed until it reaches the
+  <code>ProjectNode</code> at the top. But by then, the work is done.
+  A smarter engine would figure out the needed columns starting from the
+  top and prune unused ones as early as possible — ideally right at the
+  <code>ScanNode</code>.
+</div>
+
+<p>
+What would an optimal plan look like?
+</p>
+
+<div class="plan-annotation">
+Project [region, amount, tax]
+  WithColumn [tax = (col("amount") * 0.2)]
+    Join [inner] ['customer_id'] = ['customer_id']
+      Filter [(col("amount") > 100)]
+        <span class="good">Project [customer_id, amount]</span>         ← only what's needed
+          Scan [order_id, customer_id, amount, product] (6 rows)
+      <span class="good">Project [customer_id, region]</span>           ← only what's needed
+        Scan [customer_id, name, region, segment] (4 rows)
+</div>
+
+<p>
+The filter was pushed below the join (filter pushdown). And
+<code>ProjectNode</code> nodes were inserted right above each
+<code>ScanNode</code> to drop unused columns as early as possible. This
+transformation is called <strong class="highlight">column pruning</strong>.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Two optimizations, one insight</div>
+  Both filter pushdown and column pruning share the same core idea:
+  <em>do less work by doing it earlier</em>. Filters reduce rows; pruning
+  reduces columns. Both push their logic as close to the data source as
+  possible. And both require the ability to <em>inspect</em> the plan
+  tree — which is exactly why we built expressions as data (Module 2)
+  rather than opaque lambdas.
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- SECTION I.4: OUR ENGINE VS POLARS -->
+<!-- ============================================================ -->
+
+<h2 id="section-4">
+  <span class="lesson-num">Section I.4</span>
+  Our Engine vs. Polars — A Side-by-Side
+</h2>
+
+<p>
+At this point, you might be wondering: how close is what we've built to
+a "real" library? Let's put pyfloe and Polars side by side.
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="dot dot-pyfloe" style="width:9px;height:9px;"></span> pyfloe</h4>
+    <pre style="margin: 8px 0 0; padding: 14px 16px;"><code><span class="kw">import</span> <span class="fn">pyfloe</span> <span class="kw">as</span> pf
+
+result <span class="op">=</span> (
+  pf.LazyFrame(data)
+  .filter(pf.col(<span class="st">"amount"</span>) <span class="op">></span> <span class="nu">100</span>)
+  .join(customers, on<span class="op">=</span><span class="st">"id"</span>)
+  .select(<span class="st">"id"</span>, <span class="st">"amount"</span>)
+  .collect()
+)
+
+result.explain()
+result.schema</code></pre>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="dot" style="width:9px;height:9px;background:#E4573D;"></span> Polars</h4>
+    <pre style="margin: 8px 0 0; padding: 14px 16px;"><code><span class="kw">import</span> <span class="fn">polars</span> <span class="kw">as</span> pl
+
+result <span class="op">=</span> (
+  pl.LazyFrame(data)
+  .filter(pl.col(<span class="st">"amount"</span>) <span class="op">></span> <span class="nu">100</span>)
+  .join(customers, on<span class="op">=</span><span class="st">"id"</span>)
+  .select(<span class="st">"id"</span>, <span class="st">"amount"</span>)
+  .collect()
+)
+
+result.explain()
+result.schema</code></pre>
+  </div>
+</div>
+
+<p>
+The shapes are nearly identical. Both use <code>pf.col()</code> / <code>pl.col()</code> to reference
+columns. Both use <code>.filter()</code>, <code>.join()</code>,
+<code>.select()</code> to build the plan. Both use <code>.collect()</code>
+to trigger execution. Both have <code>.explain()</code> to print the plan
+tree and <code>.schema</code> to inspect types without running anything.
+</p>
+
+<p>
+The differences are under the hood:
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4>What pyfloe does</h4>
+    <p>
+      Pure Python. Row-at-a-time tuples (in batches of 1,024).
+      <code>dict</code>-based hash tables. Rule-based optimizer with
+      two passes. Zero dependencies. ~6,000 lines.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4>What Polars adds</h4>
+    <p>
+      Rust core via PyO3. Columnar Arrow arrays. SIMD vectorization.
+      Work-stealing parallelism (rayon). Cost-based optimizer.
+      Streaming engine for out-of-core data.
+    </p>
+  </div>
+</div>
+
+<p>
+The architecture is the same: a plan tree of nodes, an expression AST
+inside those nodes, a schema that propagates without data, and an optimizer
+that rewrites the tree. Polars is orders of magnitude faster, but the
+<em>design</em> — the thing you can learn by building it yourself —
+is exactly what you've built over the last four modules.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">The production version</div>
+  Next time you type <code>pl.col("amount") > 100</code> in Polars, you
+  know what's actually happening. A <code>__gt__</code> dunder creates a
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> node. That expression gets embedded inside a
+  <code>FilterNode</code>. The optimizer inspects it, checks
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a>, and decides whether to push it past a
+  join. The volcano model pulls rows through the tree in batches.
+  You've built every piece of that machinery. The "magic" is just
+  engineering — and now you understand it.
+</div>
+
+<details class="deep-dive">
+  <summary>Deep dive: What about PySpark?</summary>
+  <div class="deep-dive-body">
+    <p>
+      To understand PySpark's architecture, you need a bit of history.
+      Before Spark, the dominant big-data framework was <strong>Hadoop
+      MapReduce</strong>. Hadoop's insight was simple but powerful: split a
+      huge dataset across many machines (using HDFS, the Hadoop Distributed
+      File System), then process each chunk in two phases — a <em>map</em>
+      step (transform each row independently) and a <em>reduce</em> step
+      (aggregate results across all chunks). The problem? Every MapReduce job
+      wrote intermediate results back to disk. If your pipeline had five
+      steps, that was five rounds of disk I/O across the cluster. Slow.
+    </p>
+    <p>
+      Spark was created to fix exactly this. Its foundational abstraction
+      was the <strong>RDD</strong> — the Resilient Distributed Dataset. An
+      RDD is a lazy, distributed collection that tracks its own lineage:
+      instead of materializing intermediate results to disk, it remembers
+      the chain of transformations (<code>.map()</code>, <code>.filter()</code>,
+      <code>.reduceByKey()</code>) and only executes them when an
+      <em>action</em> like <code>.collect()</code> is called. Sound
+      familiar? It should — that's the same lazy plan-tree architecture
+      you've been building. RDDs were the original plan nodes, and
+      <code>.collect()</code> was the original materialisation trigger.
+    </p>
+    <p>
+      But RDDs had a limitation: they were opaque. Spark could see that you
+      called <code>.filter()</code>, but it couldn't inspect the lambda
+      <em>inside</em> the filter — exactly the problem we identified with
+      lambdas in Module 1. Without inspectable expressions, there was no way
+      to do filter pushdown or column pruning.
+    </p>
+    <p>
+      That's why Spark introduced <strong>DataFrames</strong> (and later the
+      <strong>Dataset</strong> API), backed by the <strong>Catalyst
+      optimizer</strong>. PySpark's modern API uses
+      <code>spark.createDataFrame()</code> and <code>F.col()</code> instead
+      of our <code>pf.LazyFrame()</code> and <code>pf.col()</code> — but the
+      architecture is strikingly similar. Spark builds a <em>logical
+      plan</em> (our plan tree), transforms it with Catalyst (their version
+      of filter pushdown and column pruning, plus many more rules), and
+      executes it with a <em>physical plan</em> that distributes work
+      across a cluster.
+    </p>
+    <p>
+      The key difference is distribution: Spark partitions data across
+      machines and coordinates joins and aggregations over the network. Our
+      engine runs on a single machine. But the plan tree, the expression
+      AST, and the optimizer concepts are directly transferable. The
+      evolution from Hadoop's disk-heavy MapReduce → Spark's lazy RDDs →
+      Spark's inspectable DataFrames mirrors the exact progression we
+      followed in this course: eager execution → lazy generators → expression
+      ASTs that an optimizer can reason about. If you understand what we've
+      built, you understand the architectural bones of Catalyst.
+    </p>
+  </div>
+</details>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2 id="exercises">Exercises</h2>
+
+<p>
+These exercises are designed to cement your ability to read and reason about
+plan trees — the skill you'll need most in Module 5.
+</p>
+
+<div class="interactive-box">
+  <h4>Exercise 1: Annotate the plan</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    Below is an <code>.explain()</code> output for a different pipeline.
+    For each node, identify: (a) what kind of node it is, and (b) what
+    data flows into it.
+  </p>
+  <div class="output-box" style="margin-top: 0;">Project [name, total]
+  Aggregate by=[name] aggs=[col("amount").sum()]
+    Join [inner] ['id'] = ['id']
+      Scan [id, amount, status] (1000 rows)
+      Scan [id, name, city] (200 rows)</div>
+  <div class="btn-row">
+    <button class="btn" onclick="toggleReveal('ex1-answer')">Show walkthrough</button>
+  </div>
+  <div id="ex1-answer" style="display: none; margin-top: 12px; font-size: 15px; line-height: 1.7;">
+    <p>
+      Reading bottom-up: Two <strong>ScanNodes</strong> provide the raw data
+      (1,000 rows on the left, 200 on the right). The <strong>JoinNode</strong>
+      hash-joins them on <code>id</code>, producing up to 1,000 matched rows
+      with columns from both tables. The <strong>AggNode</strong> groups by
+      <code>name</code> and computes <code>sum(amount)</code> per group. The
+      <strong>ProjectNode</strong> at the top keeps only <code>name</code>
+      and <code>total</code>.
+    </p>
+  </div>
+</div>
+
+
+<div class="interactive-box">
+  <h4>Exercise 2: Spot the waste</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    Look at this plan. Can you identify at least two sources of waste?
+  </p>
+  <div class="output-box" style="margin-top: 0;">Project [region, total_amount]
+  Filter [(col("region") == "EU")]
+    Aggregate by=[region] aggs=[col("amount").sum()]
+      Join [inner] ['cust_id'] = ['cust_id']
+        Scan [order_id, cust_id, amount, product, notes] (50000 rows)
+        Scan [cust_id, name, region, email, phone] (5000 rows)</div>
+  <div class="btn-row">
+    <button class="btn" onclick="toggleReveal('ex2-answer')">Show answer</button>
+  </div>
+  <div id="ex2-answer" style="display: none; margin-top: 12px; font-size: 15px; line-height: 1.7;">
+    <p>
+      <strong>Waste #1 — Filter is too late.</strong> The filter
+      <code>pf.col("region") == "EU"</code> depends only on <code>region</code>,
+      which comes from the customers table. It could be pushed down to
+      filter the customers <em>before</em> the join, reducing the right side
+      from 5,000 rows to only the EU customers.
+    </p>
+    <p>
+      <strong>Waste #2 — Unused columns everywhere.</strong> The final output
+      only needs <code>region</code> and <code>total_amount</code>. But the
+      orders scan reads <code>order_id</code>, <code>product</code>, and
+      <code>notes</code> — none of which are used. The customers scan reads
+      <code>name</code>, <code>email</code>, and <code>phone</code> — also
+      unused. That's 5 wasted columns flowing through a 50,000-row join.
+    </p>
+    <p>
+      <strong>Waste #3 (bonus) — Filter above aggregation.</strong> The filter
+      checks <code>region == "EU"</code>, which is a group key. It
+      <em>could</em> be pushed below the aggregation to filter rows before
+      they're grouped — but only if it's also pushed below the join first.
+      A multi-step pushdown.
+    </p>
+  </div>
+</div>
+
+
+<div class="interactive-box">
+  <h4>Exercise 3: Predict the optimized plan</h4>
+  <p style="font-family: var(--sans); font-size: 14px; margin-bottom: 12px;">
+    Given the wasteful plan from Exercise 2, draw (or describe) what the
+    optimized plan <em>should</em> look like after filter pushdown and
+    column pruning. Where does the filter end up? Where do the
+    <code>ProjectNode</code> insertions go?
+  </p>
+  <div class="btn-row">
+    <button class="btn" onclick="toggleReveal('ex3-answer')">Show optimized plan</button>
+  </div>
+  <div id="ex3-answer" style="display: none; margin-top: 12px;">
+    <div class="output-box">Project [region, total_amount]
+  Aggregate by=[region] aggs=[col("amount").sum()]
+    Join [inner] ['cust_id'] = ['cust_id']
+      Project [cust_id, amount]
+        Scan [order_id, cust_id, amount, product, notes] (50000 rows)
+      Filter [(col("region") == "EU")]
+        Project [cust_id, region]
+          Scan [cust_id, name, region, email, phone] (5000 rows)</div>
+    <p style="margin-top: 12px; font-size: 15px; line-height: 1.7;">
+      The filter was pushed down into the right branch of the join (since
+      <code>region</code> belongs to the customers table). Column pruning
+      inserted <code>ProjectNode</code>s above each scan: orders keeps only
+      <code>cust_id</code> and <code>amount</code>; customers keeps only
+      <code>cust_id</code> and <code>region</code>. The join now processes
+      2-column tuples instead of 5-column tuples, and only EU customers
+      enter the join at all.
+    </p>
+  </div>
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- TRANSITION TO MODULE 5 -->
+<!-- ============================================================ -->
+
+<div class="aside callout-purple">
+  <div class="aside-title">Coming next</div>
+  You can see the waste. You can describe exactly what the engine
+  <em>should</em> do differently. Now let's teach the engine to see
+  it too. Module 5 builds the <strong>Optimizer</strong> — a class that
+  walks the plan tree, inspects the expressions inside each node, and
+  rewrites the tree for efficiency. It's the capstone of the entire
+  course, and it brings together everything: the expression AST from
+  Module 2, the plan tree from Module 3, and the join/aggregation nodes
+  from Module 4. All of it converges in ~80 lines of Python.
+</div>
+
+<div class="source-references">
+  <h4>Source References</h4>
+
+  <div class="ref-group">
+    <h5>plan.py — Plan Nodes</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" target="_blank" rel="noopener"><code>WithColumnNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener"><code>JoinNode</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>core.py — LazyFrame API</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener"><code>LazyFrame</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20explain" target="_blank" rel="noopener"><code>explain()</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>expr.py — Expression AST</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener"><code>BinaryExpr</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" target="_blank" rel="noopener"><code>required_columns()</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>schema.py — Type System</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" target="_blank" rel="noopener"><code>LazySchema</code></a></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+function toggleReveal(id) {
+  const el = document.getElementById(id);
+  const btn = event.target;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    btn.textContent = 'Hide';
+  } else {
+    el.style.display = 'none';
+    btn.textContent = btn.textContent.includes('walkthrough') ? 'Show walkthrough' : 
+                      btn.textContent.includes('optimized') ? 'Show optimized plan' : 'Show answer';
+  }
+}
+</script>

@@ -1,0 +1,662 @@
+---
+interface Props {
+  title: string;
+  activeSlug: string;
+  moduleBadge: string;
+}
+
+const { title, activeSlug, moduleBadge } = Astro.props;
+
+const modules = [
+  { slug: 'introduction', num: '0', title: 'Introduction: Meet pyfloe', short: 'Introduction' },
+  { slug: 'module-1', num: '1', title: 'The Context & Foundation', short: 'Module 1' },
+  { slug: 'module-2', num: '2', title: 'Python Magic & Dunder Methods', short: 'Module 2' },
+  { slug: 'module-3', num: '3', title: 'The Engine Room', short: 'Module 3' },
+  { slug: 'module-4', num: '4', title: 'Advanced Algorithms', short: 'Module 4' },
+  { slug: 'module-5', num: '5', title: 'Query Optimizer', short: 'Module 5' },
+];
+
+const extras = [
+  { slug: 'interlude-wiring', title: 'Wiring It Together', short: 'Wiring' },
+  { slug: 'interlude-why', title: 'Why This Matters', short: 'Why' },
+  { slug: 'deep-dive-streaming', title: 'Streaming I/O', short: 'Streaming' },
+  { slug: 'epilogue', title: 'Epilogue', short: 'Epilogue' },
+];
+
+// Find prev/next for page navigation
+const allPages = [...modules, ...extras];
+const currentIndex = allPages.findIndex(p => p.slug === activeSlug);
+const prevPage = currentIndex > 0 ? allPages[currentIndex - 1] : null;
+const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1] : null;
+---
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} — Build Your Own DataFrame</title>
+  <link rel="stylesheet" href="/global.css">
+</head>
+<body>
+  <div class="reading-progress" id="reading-progress"></div>
+  <div class="page-layout">
+    <aside class="sidebar" id="sidebar">
+      <a class="sidebar-brand" href="/">
+        <span class="sidebar-brand-icon">&#9671;</span>
+        Build Your Own DataFrame
+      </a>
+
+      <div class="sidebar-search">
+        <div class="search-input-wrap">
+          <svg class="search-icon" width="15" height="15" viewBox="0 0 15 15" fill="none">
+            <circle cx="6.5" cy="6.5" r="5" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+          <input type="text" id="site-search" class="search-input" placeholder="Search the course..." autocomplete="off" />
+        </div>
+        <div class="search-results" id="search-results"></div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="sidebar-section-label">Modules</div>
+        {modules.map(m => (
+          <a
+            href={`/${m.slug}/`}
+            class:list={['sidebar-link', { active: activeSlug === m.slug }]}
+          >
+            <span class="sidebar-link-num">{m.num}</span>
+            <span class="sidebar-link-title">{m.short === 'Introduction' ? 'Introduction' : m.title}</span>
+          </a>
+        ))}
+
+        <div class="sidebar-section-label" style="margin-top: 14px;">Extras</div>
+        {extras.map(e => (
+          <a
+            href={`/${e.slug}/`}
+            class:list={['sidebar-link', { active: activeSlug === e.slug }]}
+          >
+            <span class="sidebar-link-num">+</span>
+            <span class="sidebar-link-title">{e.short}</span>
+          </a>
+        ))}
+      </nav>
+    </aside>
+
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <main class="main-content">
+      <header class="mobile-header">
+        <button class="mobile-menu-toggle" id="menu-toggle" aria-label="Open navigation">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+            <path d="M3 6h16M3 11h16M3 16h16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <span class="mobile-header-title">Build Your Own DataFrame</span>
+      </header>
+
+      <div class="course-container">
+        <div class="module-badge">{moduleBadge}</div>
+        <slot />
+
+        <div class="page-nav">
+          {prevPage ? (
+            <a href={`/${prevPage.slug}/`} class="page-nav-prev">&larr; {prevPage.short || prevPage.title}</a>
+          ) : <span />}
+          {nextPage ? (
+            <a href={`/${nextPage.slug}/`} class="page-nav-next">{nextPage.short || nextPage.title} &rarr;</a>
+          ) : <span />}
+        </div>
+        <footer class="site-footer">Created by Edward van Eechoud</footer>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // Mobile sidebar
+    const toggle = document.getElementById('menu-toggle');
+    const sidebar = document.getElementById('sidebar');
+    const backdrop = document.getElementById('sidebar-backdrop');
+
+    function openSidebar() {
+      sidebar?.classList.add('open');
+      backdrop?.classList.add('open');
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeSidebar() {
+      sidebar?.classList.remove('open');
+      backdrop?.classList.remove('open');
+      document.body.style.overflow = '';
+    }
+
+    toggle?.addEventListener('click', openSidebar);
+    backdrop?.addEventListener('click', closeSidebar);
+
+    // Reading progress bar
+    const progressBar = document.getElementById('reading-progress');
+    function updateProgress() {
+      const scrollTop = window.scrollY;
+      const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+      if (docHeight > 0 && progressBar) {
+        progressBar.style.width = Math.min(100, (scrollTop / docHeight) * 100) + '%';
+      }
+    }
+    window.addEventListener('scroll', updateProgress, { passive: true });
+    updateProgress();
+
+    // Scroll-reveal for sections and grids
+    const revealTargets = document.querySelectorAll(
+      'h2, .aside, .interactive-box, .deep-dive, .toc, .arch-box, ' +
+      '.feature-grid, .comparison-grid, .recap-grid, .before-after, ' +
+      '.convergence-box, .plan-tree, .flow-diagram, .download-box, ' +
+      '.resource-card, .open-question, pre, .module-map'
+    );
+
+    revealTargets.forEach(el => el.classList.add('reveal'));
+
+    const revealObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          revealObserver.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+
+    revealTargets.forEach(el => revealObserver.observe(el));
+
+    // Copy button on non-runner code blocks
+    document.querySelectorAll('pre:not([data-executable])').forEach(pre => {
+      const btn = document.createElement('button');
+      btn.className = 'copy-btn';
+      btn.textContent = 'Copy';
+      btn.addEventListener('click', () => {
+        const code = pre.querySelector('code');
+        const text = code ? code.textContent : pre.textContent;
+        navigator.clipboard.writeText(text || '').then(() => {
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = 'Copy';
+            btn.classList.remove('copied');
+          }, 2000);
+        });
+      });
+      pre.style.position = 'relative';
+      pre.appendChild(btn);
+    });
+
+    // ============================================================
+    // PYODIDE INTERACTIVE RUNNER
+    // ============================================================
+
+    const runnableBlocks = document.querySelectorAll('pre[data-executable]');
+
+    if (runnableBlocks.length > 0) {
+      // State
+      let pyodideInstance = null;
+      let pyodideReady = false;
+      let pyodideLoading = false;
+      const runners = [];
+
+      // Build runner UI for each executable block
+      runnableBlocks.forEach((pre, idx) => {
+        const code = pre.querySelector('code');
+        const rawCode = code ? code.textContent : pre.textContent;
+        const label = pre.getAttribute('data-label') || 'Interactive Python';
+        const startExpanded = pre.hasAttribute('data-expanded');
+
+        // Remove the preceding code-label div if present
+        const prevEl = pre.previousElementSibling;
+        if (prevEl && prevEl.classList.contains('code-label')) {
+          prevEl.remove();
+        }
+
+        // Create runner container
+        const runner = document.createElement('div');
+        runner.className = 'runner-block reveal visible' + (startExpanded ? ' expanded' : ' collapsed');
+
+        // Header (clickable to toggle)
+        const header = document.createElement('div');
+        header.className = 'runner-header';
+        header.innerHTML = `
+          <div class="runner-header-left">
+            <svg class="runner-play-icon" width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <path d="M3.5 2L11.5 7L3.5 12V2Z" fill="currentColor"/>
+            </svg>
+            <span class="runner-label">${label}</span>
+            <span class="runner-toggle-hint">${startExpanded ? 'collapse' : 'click to open'}</span>
+          </div>
+          <div class="runner-header-right">
+            <span class="runner-badge loading" data-badge="${idx}">Loading Python...</span>
+            <button class="runner-toggle-btn" aria-label="Toggle editor">
+              <svg class="runner-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <path d="M4.5 5.5L7 8L9.5 5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        `;
+
+        // Collapsible body
+        const body = document.createElement('div');
+        body.className = 'runner-body';
+
+        // Editor with syntax highlighting overlay
+        const editor = document.createElement('div');
+        editor.className = 'runner-editor';
+
+        const highlight = document.createElement('pre');
+        highlight.className = 'runner-highlight';
+        highlight.setAttribute('aria-hidden', 'true');
+
+        const textarea = document.createElement('textarea');
+        textarea.value = rawCode.trim();
+        textarea.spellcheck = false;
+        textarea.setAttribute('autocapitalize', 'off');
+        textarea.setAttribute('autocomplete', 'off');
+        textarea.setAttribute('autocorrect', 'off');
+
+        function syncHighlight() {
+          highlight.innerHTML = highlightPython(textarea.value) + '\n';
+          textarea.style.height = 'auto';
+          textarea.style.height = textarea.scrollHeight + 'px';
+          highlight.style.height = textarea.style.height;
+        }
+
+        textarea.addEventListener('input', syncHighlight);
+        textarea.addEventListener('scroll', () => {
+          highlight.scrollTop = textarea.scrollTop;
+          highlight.scrollLeft = textarea.scrollLeft;
+        });
+
+        editor.appendChild(highlight);
+        editor.appendChild(textarea);
+
+        // Toolbar
+        const toolbar = document.createElement('div');
+        toolbar.className = 'runner-toolbar';
+
+        const runBtn = document.createElement('button');
+        runBtn.className = 'runner-btn runner-btn-run';
+        runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Run';
+        runBtn.disabled = true;
+
+        const resetBtn = document.createElement('button');
+        resetBtn.className = 'runner-btn runner-btn-reset';
+        resetBtn.textContent = 'Reset';
+
+        toolbar.appendChild(runBtn);
+        toolbar.appendChild(resetBtn);
+
+        // Output
+        const output = document.createElement('div');
+        output.className = 'runner-output';
+
+        body.appendChild(editor);
+        body.appendChild(toolbar);
+        body.appendChild(output);
+
+        runner.appendChild(header);
+        runner.appendChild(body);
+
+        pre.replaceWith(runner);
+
+        // Toggle expand/collapse
+        const toggleHint = header.querySelector('.runner-toggle-hint');
+        function toggleRunner() {
+          const isCollapsed = runner.classList.contains('collapsed');
+          runner.classList.toggle('collapsed', !isCollapsed);
+          runner.classList.toggle('expanded', isCollapsed);
+          toggleHint.textContent = isCollapsed ? 'collapse' : 'click to open';
+          if (isCollapsed) {
+            requestAnimationFrame(() => syncHighlight());
+          }
+        }
+        header.addEventListener('click', (e) => {
+          if (e.target.closest('.runner-badge')) return;
+          toggleRunner();
+        });
+        header.style.cursor = 'pointer';
+
+        // Initial highlight + auto-size
+        requestAnimationFrame(() => {
+          syncHighlight();
+        });
+
+        // Store references
+        runners.push({ textarea, runBtn, resetBtn, output, rawCode: rawCode.trim(), badge: header.querySelector(`[data-badge="${idx}"]`) });
+
+        // Reset handler
+        resetBtn.addEventListener('click', () => {
+          textarea.value = rawCode.trim();
+          syncHighlight();
+          output.classList.remove('visible', 'has-error');
+          output.textContent = '';
+        });
+
+        // Run handler
+        runBtn.addEventListener('click', async () => {
+          if (!pyodideReady) return;
+          runBtn.disabled = true;
+          runBtn.classList.add('running');
+          runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Running...';
+          output.classList.remove('has-error');
+          output.classList.add('visible');
+          output.innerHTML = '<span class="output-label">Output</span>';
+
+          try {
+            // Redirect stdout/stderr
+            pyodideInstance.runPython(`
+import sys, io
+_stdout_capture = io.StringIO()
+_stderr_capture = io.StringIO()
+sys.stdout = _stdout_capture
+sys.stderr = _stderr_capture
+`);
+
+            // Run user code
+            let result;
+            try {
+              result = await pyodideInstance.runPythonAsync(textarea.value);
+            } catch (pyErr) {
+              pyodideInstance.runPython(`sys.stdout = sys.__stdout__; sys.stderr = sys.__stderr__`);
+              output.classList.add('has-error');
+              output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(pyErr.message);
+              return;
+            }
+
+            // Capture output
+            const stdout = pyodideInstance.runPython(`_stdout_capture.getvalue()`);
+            const stderr = pyodideInstance.runPython(`_stderr_capture.getvalue()`);
+
+            // Restore
+            pyodideInstance.runPython(`sys.stdout = sys.__stdout__; sys.stderr = sys.__stderr__`);
+
+            let text = '';
+            if (stdout) text += stdout;
+            if (stderr) { text += stderr; output.classList.add('has-error'); }
+            if (result !== undefined && result !== null && !stdout) {
+              text += String(result);
+            }
+            if (!text.trim()) text = '(no output)';
+            output.innerHTML = '<span class="output-label">Output</span>' + escapeHtml(text);
+          } catch (e) {
+            output.classList.add('has-error');
+            output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(String(e));
+          } finally {
+            runBtn.disabled = false;
+            runBtn.classList.remove('running');
+            runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Run';
+          }
+        });
+
+        // Ctrl+Enter to run
+        textarea.addEventListener('keydown', (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            runBtn.click();
+          }
+          // Tab support
+          if (e.key === 'Tab') {
+            e.preventDefault();
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            textarea.value = textarea.value.substring(0, start) + '    ' + textarea.value.substring(end);
+            textarea.selectionStart = textarea.selectionEnd = start + 4;
+          }
+        });
+      });
+
+      function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+      }
+
+      // Python syntax highlighter
+      function highlightPython(code) {
+        const keywords = new Set([
+          'False','None','True','and','as','assert','async','await',
+          'break','class','continue','def','del','elif','else','except',
+          'finally','for','from','global','if','import','in','is',
+          'lambda','nonlocal','not','or','pass','raise','return',
+          'try','while','with','yield'
+        ]);
+        const builtins = new Set([
+          'print','len','range','int','float','str','bool','list',
+          'dict','set','tuple','type','isinstance','enumerate','zip',
+          'map','filter','sorted','reversed','abs','max','min','sum',
+          'open','super','property','staticmethod','classmethod',
+          'hasattr','getattr','setattr','iter','next','repr','hash'
+        ]);
+
+        // Tokenize with a single regex
+        const tokenRe = /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|"""[\s\S]*?"""|'''[\s\S]*?'''|#[^\n]*|\b\d+(?:\.\d+)?\b|[a-zA-Z_]\w*|[+\-*\/%=<>!&|^~@]+|[()[\]{},.:;]|\S)/g;
+
+        let result = '';
+        let lastIndex = 0;
+
+        for (const match of code.matchAll(tokenRe)) {
+          // Add any whitespace/gaps between tokens
+          if (match.index > lastIndex) {
+            result += escapeHtml(code.slice(lastIndex, match.index));
+          }
+          lastIndex = match.index + match[0].length;
+
+          const tok = match[0];
+          const esc = escapeHtml(tok);
+
+          if (tok.startsWith('#')) {
+            result += `<span class="hl-comment">${esc}</span>`;
+          } else if (tok.startsWith('"') || tok.startsWith("'")) {
+            result += `<span class="hl-string">${esc}</span>`;
+          } else if (/^\d/.test(tok)) {
+            result += `<span class="hl-number">${esc}</span>`;
+          } else if (keywords.has(tok)) {
+            result += `<span class="hl-keyword">${esc}</span>`;
+          } else if (builtins.has(tok)) {
+            result += `<span class="hl-builtin">${esc}</span>`;
+          } else if (/^[a-zA-Z_]\w*$/.test(tok)) {
+            // Check if followed by ( to detect function calls
+            const after = code.slice(lastIndex).match(/^\s*\(/);
+            if (after) {
+              result += `<span class="hl-func">${esc}</span>`;
+            } else {
+              result += esc;
+            }
+          } else if (/^[+\-*\/%=<>!&|^~@]+$/.test(tok)) {
+            result += `<span class="hl-operator">${esc}</span>`;
+          } else if (tok === '(' || tok === ')' || tok === '[' || tok === ']' || tok === '{' || tok === '}') {
+            result += `<span class="hl-paren">${esc}</span>`;
+          } else if (tok === '.' || tok === ',' || tok === ':' || tok === ';') {
+            result += `<span class="hl-punct">${esc}</span>`;
+          } else {
+            result += esc;
+          }
+        }
+
+        // Any trailing text
+        if (lastIndex < code.length) {
+          result += escapeHtml(code.slice(lastIndex));
+        }
+
+        return result;
+      }
+
+      // Load Pyodide
+      async function initPyodide() {
+        if (pyodideLoading) return;
+        pyodideLoading = true;
+
+        try {
+          // Load Pyodide script
+          const script = document.createElement('script');
+          script.src = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.js';
+          document.head.appendChild(script);
+
+          await new Promise((resolve, reject) => {
+            script.onload = resolve;
+            script.onerror = reject;
+          });
+
+          // Initialize
+          pyodideInstance = await loadPyodide();
+          await pyodideInstance.loadPackage('micropip');
+          const micropip = pyodideInstance.pyimport('micropip');
+          await micropip.install('pyfloe');
+
+          pyodideReady = true;
+
+          // Update all badges and enable buttons
+          runners.forEach(r => {
+            r.badge.textContent = 'Ready';
+            r.badge.classList.remove('loading');
+            r.runBtn.disabled = false;
+          });
+        } catch (e) {
+          console.error('Pyodide init failed:', e);
+          runners.forEach(r => {
+            r.badge.textContent = 'Failed to load';
+            r.badge.classList.remove('loading');
+            r.badge.style.color = '#F38BA8';
+            r.badge.style.background = 'rgba(243, 139, 168, 0.1)';
+          });
+        }
+      }
+
+      // Start loading Pyodide when first runner scrolls into view
+      const loadObserver = new IntersectionObserver((entries) => {
+        if (entries.some(e => e.isIntersecting)) {
+          loadObserver.disconnect();
+          initPyodide();
+        }
+      }, { rootMargin: '200px' });
+
+      document.querySelectorAll('.runner-block').forEach(el => loadObserver.observe(el));
+    }
+
+    // ============================================================
+    // SITE SEARCH
+    // ============================================================
+    (function() {
+      const searchInput = document.getElementById('site-search');
+      const searchResults = document.getElementById('search-results');
+      let index = null;
+      let indexLoading = false;
+
+      async function loadIndex() {
+        if (index || indexLoading) return;
+        indexLoading = true;
+        try {
+          const res = await fetch('/search-index.json');
+          index = await res.json();
+        } catch (e) {
+          indexLoading = false;
+        }
+      }
+
+      function highlight(text, terms) {
+        let result = text;
+        for (const term of terms) {
+          const re = new RegExp('(' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+          result = result.replace(re, '<mark>$1</mark>');
+        }
+        return result;
+      }
+
+      function search(query) {
+        if (!index || !query.trim()) {
+          searchResults.innerHTML = '';
+          searchResults.classList.remove('open');
+          return;
+        }
+
+        const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+        if (terms.length === 0) {
+          searchResults.innerHTML = '';
+          searchResults.classList.remove('open');
+          return;
+        }
+
+        const results = [];
+
+        for (const page of index) {
+          for (const section of page.sections) {
+            const textLower = section.text.toLowerCase();
+            const headingLower = section.heading.toLowerCase();
+            const matches = terms.every(t => textLower.includes(t) || headingLower.includes(t));
+            if (matches) {
+              // Find a snippet around the first match
+              const firstTerm = terms[0];
+              const pos = textLower.indexOf(firstTerm);
+              const start = Math.max(0, pos - 40);
+              const end = Math.min(section.text.length, pos + firstTerm.length + 80);
+              let snippet = (start > 0 ? '...' : '') +
+                section.text.substring(start, end) +
+                (end < section.text.length ? '...' : '');
+
+              results.push({
+                slug: page.slug,
+                pageTitle: page.title,
+                heading: section.heading,
+                snippet: highlight(snippet, terms),
+              });
+            }
+          }
+        }
+
+        if (results.length === 0) {
+          searchResults.innerHTML = '<div class="search-empty">No results found</div>';
+          searchResults.classList.add('open');
+          return;
+        }
+
+        // Group by page, max 8 results
+        const shown = results.slice(0, 8);
+        let html = '';
+        let lastSlug = '';
+        for (const r of shown) {
+          if (r.slug !== lastSlug) {
+            html += '<div class="search-page-title">' + r.pageTitle + '</div>';
+            lastSlug = r.slug;
+          }
+          html += '<a class="search-result" href="/' + r.slug + '/">' +
+            '<div class="search-result-heading">' + highlight(r.heading, terms) + '</div>' +
+            '<div class="search-result-snippet">' + r.snippet + '</div>' +
+            '</a>';
+        }
+        if (results.length > 8) {
+          html += '<div class="search-empty">' + (results.length - 8) + ' more results...</div>';
+        }
+        searchResults.innerHTML = html;
+        searchResults.classList.add('open');
+      }
+
+      let debounceTimer;
+      searchInput?.addEventListener('focus', loadIndex);
+      searchInput?.addEventListener('input', function() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => search(this.value), 150);
+      });
+
+      // Close on click outside
+      document.addEventListener('click', function(e) {
+        if (!e.target.closest('.sidebar-search')) {
+          searchResults?.classList.remove('open');
+        }
+      });
+
+      // Close on Escape
+      searchInput?.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+          this.value = '';
+          searchResults.innerHTML = '';
+          searchResults.classList.remove('open');
+          this.blur();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

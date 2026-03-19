@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/module-1.html?raw';
+---
+
+<CourseLayout title="The Context & Foundation" activeSlug="module-1" moduleBadge="Module 1 of 5">
+  <Fragment set:html={html} />
+</CourseLayout>

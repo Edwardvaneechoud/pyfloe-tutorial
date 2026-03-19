@@ -1,0 +1,1346 @@
+<h1>The Query<br><em>Optimizer</em></h1>
+
+<p class="subtitle">
+Everything you've built — expressions, plan nodes, hash joins, aggregations —
+has been heading here. The optimizer is the moment your engine learns to
+<em>think</em>. It looks at the plan tree you gave it, spots the waste,
+and quietly rewrites the tree into a better one — before a single row of
+data flows.
+</p>
+
+<p>
+In Module 2, you built expression trees — inspectable objects that know which
+columns they need. In Modules 3 and 4, you built plan trees — chains of
+nodes that pull data through the volcano model. In this module, those two
+trees converge. The optimizer <strong>walks</strong> the plan tree and
+<strong>inspects</strong> the expressions inside each node to decide what
+can be moved, what can be removed, and what can be made cheaper.
+</p>
+
+<p>
+This is the approach that powers Polars's query planner, Spark's
+Catalyst optimizer, and every serious database engine. And by the end of
+this module, you will have built your own — in about 80 lines of Python.
+</p>
+
+<div class="convergence-box">
+  <div class="trees">
+    <div class="tree-label" style="border-left: 3px solid var(--purple);">
+      Expression Tree<br><span style="font-size: 12px; color: var(--text-muted);">Module 2</span>
+    </div>
+    <div class="arrow">+</div>
+    <div class="tree-label" style="border-left: 3px solid var(--accent);">
+      Plan Tree<br><span style="font-size: 12px; color: var(--text-muted);">Modules 3 &amp; 4</span>
+    </div>
+    <div class="arrow">=</div>
+    <div class="tree-label" style="border-left: 3px solid var(--teal); background: var(--teal-bg);">
+      Optimizer<br><span style="font-size: 12px; color: var(--text-muted);">Module 5</span>
+    </div>
+  </div>
+  <div class="result">The two trees finally converge.</div>
+</div>
+
+<nav class="toc">
+  <div class="toc-title">In this module</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">5.1</span> What Is a Query Optimizer?</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">5.2</span> Walking the Tree: Recursive Plan Traversal</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">5.3</span> Filter Pushdown</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">5.4</span> Column Pruning</a>
+  <a class="toc-item" href="#lesson-5"><span class="toc-num">5.5</span> Seeing the Difference</a>
+</nav>
+
+
+<!-- ============================================================ -->
+<!-- LESSON 5.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Lesson 5.1</span>
+  What Is a Query Optimizer?
+</h2>
+
+<p>
+Let's start with the problem. Here's a realistic pipeline — joining orders
+with customers, filtering for a region, and selecting three columns:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> A typical pipeline</div>
+<pre><code><span class="va">result</span> <span class="op">=</span> (
+    <span class="va">orders</span>
+    .<span class="fn">join</span>(<span class="va">customers</span>, <span class="va">on</span><span class="op">=</span><span class="st">"customer_id"</span>)
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"region"</span>) <span class="op">==</span> <span class="st">"EU"</span>)
+    .<span class="fn">select</span>(<span class="st">"order_id"</span>, <span class="st">"name"</span>, <span class="st">"amount"</span>)
+    .<span class="fn">collect</span>()
+)</code></pre>
+
+<p>
+This works correctly. But think about what the engine actually does. It
+joins <em>every</em> order with <em>every</em> customer — all rows, all
+columns. Then it filters out non-EU rows. Then it drops all columns except
+three. The join was the most expensive operation, and we forced it to
+process rows and columns that we knew we didn't need.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The waste</div>
+  The filter sits <em>above</em> the join, so the join processes all rows.
+  The select sits at the top, so every node below it carries all 20 columns
+  through the entire pipeline. Both problems are invisible to the user —
+  but they're visible in the plan tree.
+</div>
+
+<p>
+Here's what the unoptimized plan looks like:
+</p>
+
+<div class="plan-tree"><span class="node">Project</span> [order_id, name, amount]
+  <span class="filter-node">Filter</span> [(col("region") == 'EU')]  <span class="annotation">&larr; filters AFTER the join</span>
+    <span class="node">Join</span> [inner] on customer_id
+      <span class="node">Scan</span> [order_id, customer_id, amount, date, ...] (100K rows)
+      <span class="node">Scan</span> [customer_id, name, region, segment, ...] (5K rows)</div>
+
+<p>
+A query optimizer is a program that takes this plan tree as input and
+produces a <em>better</em> plan tree as output — one that computes the
+same result, but does less work to get there. It can't change
+what you asked for. It can only change <em>how</em> the engine computes it.
+</p>
+
+<h3>Two families of optimizers</h3>
+
+<p>
+There are two fundamentally different approaches to query optimization:
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-before">Rule-Based</span></h4>
+    <p>
+      Applies fixed rewrite rules: "always push filters down," "always
+      prune unused columns." Simple, predictable, and fast. Used by
+      pyfloe, early versions of Spark, and most teaching engines.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-after">Cost-Based</span></h4>
+    <p>
+      Estimates the <em>cost</em> of different plans using statistics
+      (row counts, cardinality). Picks the cheapest. Used by
+      PostgreSQL, modern Spark Catalyst, and Polars for join ordering.
+    </p>
+  </div>
+</div>
+
+<p>
+We're building a rule-based optimizer — pyfloe's approach. It applies two
+rewrite passes to the plan tree:
+</p>
+
+<p>
+<strong>Pass 1: Filter pushdown</strong> — moves <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a>s
+closer to the data source, so fewer rows flow through expensive operations
+like joins.
+</p>
+
+<p>
+<strong>Pass 2: Column pruning</strong> — removes columns that no
+downstream node needs, so each row carries only the data that matters.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Why laziness makes this possible</div>
+  An optimizer can only rewrite a plan that <em>hasn't run yet</em>.
+  If the engine were eager — executing each operation immediately — the
+  data would already be flowing by the time we realized the filter should
+  have gone first. Lazy execution builds the entire plan tree before
+  executing anything, giving the optimizer a window to inspect and rewrite
+  it. This is the fundamental payoff of everything we built in Module 1.
+</div>
+
+<p>
+Here's what the <em>optimized</em> plan looks like:
+</p>
+
+<div class="plan-tree"><span class="node">Project</span> [order_id, name, amount]
+  <span class="node">Join</span> [inner] on customer_id
+    <span class="pushed">Filter</span> [(col("region") == 'EU')]  <span class="annotation">&larr; pushed into the left branch!</span>
+      <span class="pruned">Project</span> [order_id, customer_id, amount]  <span class="annotation">&larr; only 3 cols, not 20</span>
+        <span class="node">Scan</span> (100K rows)
+    <span class="pruned">Project</span> [customer_id, name]  <span class="annotation">&larr; only 2 cols, not 8</span>
+      <span class="node">Scan</span> (5K rows)</div>
+
+<p>
+Same result. Dramatically less work. The filter now runs <em>before</em>
+the join, reducing the left side from 100K rows to however many are in
+the EU. The scans now carry only the columns needed downstream. And the
+user's code didn't change at all — the optimizer rewrote the plan
+silently, behind the scenes.
+</p>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 5.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Lesson 5.2</span>
+  Walking the Tree: Recursive Plan Traversal
+</h2>
+
+<p>
+Before we can optimize a plan tree, we need to be able to <em>walk</em> it.
+Every optimization pass follows the same pattern: start at the root,
+examine each node, decide whether to transform it, then recurse into its
+children. This is recursive tree traversal — the same technique used by
+compilers, linters, and every AST-processing tool you've ever used.
+</p>
+
+<p>
+Let's start with the structure of our optimizer. At its core, it's
+remarkably simple:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> The optimizer skeleton</div>
+<pre><code><span class="kw">class</span> <span class="cl">Optimizer</span>:
+
+    <span class="kw">def</span> <span class="fn">optimize</span>(<span class="va">self</span>, <span class="va">plan</span>: <span class="cl">PlanNode</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+        <span class="cm">"""Apply all optimization passes to a plan tree."""</span>
+        <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">plan</span>)
+        <span class="va">needed</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">plan</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+        <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">plan</span>, <span class="va">needed</span>)
+        <span class="kw">return</span> <span class="va">plan</span></code></pre>
+
+<p>
+Three lines of real logic. Two passes, applied in sequence. The order
+matters: filter pushdown first (to reduce row counts), then column pruning
+(to reduce row widths). Each pass receives a plan tree and returns a new,
+rewritten plan tree. The original tree is never mutated.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Immutable rewriting</div>
+  Notice that <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20optimize" class="source-link" target="_blank" rel="noopener"><code>optimize()</code></a> returns a <em>new</em> plan tree —
+  it doesn't modify the existing one. This is the same immutable pattern
+  you saw in Module 3, where <code>.filter()</code> returns a new
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> wrapping a new <code>FilterNode</code>. Immutable
+  trees are easier to reason about and safer to compose.
+</div>
+
+<h3>Pattern matching with <code>isinstance</code></h3>
+
+<p>
+The core technique for walking the tree is <code>isinstance</code>
+dispatch — checking what <em>type</em> of node we're looking at and
+handling each type differently. This is Python's version of pattern matching
+on an algebraic data type. Here's what the filter pushdown walk looks like
+at a high level:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> The recursive walk — simplified</div>
+<pre><code><span class="kw">def</span> <span class="fn">_push_filters</span>(<span class="va">self</span>, <span class="va">node</span>: <span class="cl">PlanNode</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">FilterNode</span>):
+        <span class="cm"># This is where the magic happens —</span>
+        <span class="cm"># try to push this filter closer to the data</span>
+        <span class="va">child</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>)
+        <span class="kw">return</span> <span class="va">self</span>.<span class="fn">_try_push_filter</span>(<span class="va">node</span>.<span class="va">predicate</span>, <span class="va">child</span>)
+
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">ProjectNode</span>):
+        <span class="cm"># Not a filter — just recurse into the child</span>
+        <span class="kw">return</span> <span class="cl">ProjectNode</span>(
+            <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>),
+            <span class="va">node</span>.<span class="va">_columns</span>, <span class="va">node</span>.<span class="va">_exprs</span>
+        )
+
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">JoinNode</span>):
+        <span class="cm"># Recurse into both branches</span>
+        <span class="kw">return</span> <span class="cl">JoinNode</span>(
+            <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">left</span>),
+            <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">right</span>),
+            <span class="va">node</span>.<span class="va">left_on</span>, <span class="va">node</span>.<span class="va">right_on</span>, <span class="va">node</span>.<span class="va">how</span>,
+        )
+
+    <span class="cm"># Leaf nodes (ScanNode, etc.) — nothing to recurse into</span>
+    <span class="kw">return</span> <span class="va">node</span></code></pre>
+
+<p>
+Read this carefully. The pattern is always the same: check the node type,
+recurse into children, and rebuild the node with the (potentially
+transformed) children. For most node types, the logic is "just recurse
+and rebuild" — only <code>FilterNode</code> gets special treatment,
+because that's the node type we're trying to move.
+</p>
+
+<p>
+There are two critical things happening here that are easy to miss:
+</p>
+
+<p>
+<strong>First: the walk is top-down.</strong> We start at the root and
+work toward the leaves. When we find a <code>FilterNode</code>, we
+first recurse into its child (handling any filters <em>below</em> it),
+then try to push <em>this</em> filter further down. This means filters
+naturally cascade toward the data source.
+</p>
+
+<p>
+<strong>Second: we rebuild the tree as we go.</strong> Every
+<code>isinstance</code> branch constructs a <em>new</em> node with the
+recursively-transformed children. This is what makes the rewrite immutable
+— we're constructing a new tree, not mutating the old one.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  Spark's Catalyst optimizer uses this same pattern — each "rule" is a
+  function that pattern-matches on node types and returns a transformed
+  tree. Polars does it in Rust with <code>match</code> expressions.
+  The pattern is universal because the problem is: you have a tree,
+  you want to transform it, and each node type needs different handling.
+</div>
+
+<h3>How <code>LazyFrame</code> triggers the optimizer</h3>
+
+<p>
+Where does the optimizer actually get called? In pyfloe, every
+<code>LazyFrame</code> has a <code>_exec_plan</code> property that lazily
+optimizes the plan the first time it's needed:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's LazyFrame — triggering optimization</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"_plan"</span>, <span class="st">"_materialized"</span>, <span class="st">"_name"</span>, <span class="st">"_optimized"</span>)
+
+    <span class="op">@</span><span class="bi">property</span>
+    <span class="kw">def</span> <span class="fn">_exec_plan</span>(<span class="va">self</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+        <span class="kw">if</span> <span class="va">self</span>.<span class="va">_optimized</span> <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="va">self</span>.<span class="va">_optimized</span> <span class="op">=</span> <span class="cl">Optimizer</span>().<span class="fn">optimize</span>(<span class="va">self</span>.<span class="va">_plan</span>)
+        <span class="kw">return</span> <span class="va">self</span>.<span class="va">_optimized</span>
+
+    <span class="kw">def</span> <span class="fn">collect</span>(<span class="va">self</span>, <span class="va">optimize</span>: <span class="bi">bool</span> <span class="op">=</span> <span class="kw">True</span>) <span class="op">-></span> <span class="cl">LazyFrame</span>:
+        <span class="kw">if</span> <span class="va">self</span>.<span class="va">_materialized</span> <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>.<span class="va">_exec_plan</span> <span class="kw">if</span> <span class="va">optimize</span> <span class="kw">else</span> <span class="va">self</span>.<span class="va">_plan</span>
+            <span class="va">data</span> <span class="op">=</span> []
+            <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">plan</span>.<span class="fn">execute_batched</span>():
+                <span class="va">data</span>.<span class="fn">extend</span>(<span class="va">chunk</span>)
+            <span class="va">self</span>.<span class="va">_materialized</span> <span class="op">=</span> <span class="va">data</span>
+        <span class="kw">return</span> <span class="va">self</span></code></pre>
+
+<p>
+When <code>.collect()</code> is called, it accesses
+<code>self._exec_plan</code>, which triggers optimization exactly once.
+The optimized plan is cached in <code>_optimized</code>, so subsequent
+calls to <code>.collect()</code>, <code>.head()</code>, or
+<code>.count()</code> reuse the same plan. The user can also pass
+<code>optimize=False</code> to bypass the optimizer entirely — useful
+for debugging or benchmarking.
+</p>
+
+<p>
+And of course, the user can compare plans directly:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> Comparing plans</div>
+<pre><code><span class="bi">print</span>(<span class="va">pipeline</span>.<span class="fn">explain</span>())                  <span class="cm"># unoptimized plan</span>
+<span class="bi">print</span>(<span class="va">pipeline</span>.<span class="fn">explain</span>(<span class="va">optimized</span><span class="op">=</span><span class="kw">True</span>))    <span class="cm"># optimized plan</span></code></pre>
+
+<p>
+This is the same <code>.explain()</code> you'd find in Polars
+(<code>lf.explain(optimized=True)</code>) or Spark
+(<code>df.explain(True)</code>). Every lazy engine gives you a way to
+inspect the plan before and after optimization. Now let's build
+what happens between those two calls.
+</p>
+
+<pre data-executable data-label="See the optimizer in action"><code>import pyfloe as pf
+
+orders = pf.LazyFrame([
+    {"order_id": 1, "customer_id": 101, "amount": 250.0},
+    {"order_id": 2, "customer_id": 102, "amount": 45.0},
+    {"order_id": 3, "customer_id": 103, "amount": 180.0},
+    {"order_id": 4, "customer_id": 101, "amount": 320.0},
+])
+
+customers = pf.LazyFrame([
+    {"customer_id": 101, "name": "Alice", "region": "EU"},
+    {"customer_id": 102, "name": "Bob",   "region": "US"},
+    {"customer_id": 103, "name": "Carol", "region": "EU"},
+])
+
+# Build the pipeline: join → filter → select
+pipeline = (
+    orders
+    .join(customers, on="customer_id")
+    .filter(pf.col("amount") > 100)
+    .select("name", "amount")
+)
+
+# BEFORE: filter sits above the join
+print("=== Unoptimized ===")
+print(pipeline.explain())
+
+# AFTER: the optimizer pushes the filter DOWN past the join
+# (because amount only depends on orders, not customers)
+# and prunes unused columns from the scan
+print("=== Optimized ===")
+print(pipeline.explain(optimized=True))
+
+# You can also call the Optimizer directly on plan nodes
+from pyfloe.plan import Optimizer
+opt = Optimizer()
+optimized_plan = opt.optimize(pipeline._plan)
+print("=== Optimized plan node ===")
+print(optimized_plan.explain())
+
+# Execute
+pipeline.collect()
+print("\n=== Result ===")
+for row in pipeline.to_pylist():
+    print(row)</code></pre>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Try it yourself</div>
+  Modify the pipeline above. What happens if you add a second filter
+  &mdash; say, <code>.filter(pf.col("region") == "EU")</code>? Where
+  does the optimizer push each filter? Try changing which columns you
+  <code>.select()</code> and compare the optimized plans. Can you
+  predict what columns the optimizer will prune before running
+  <code>.explain(optimized=True)</code>?
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 5.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Lesson 5.3</span>
+  Filter Pushdown
+</h2>
+
+<p>
+Filter pushdown is the single most impactful optimization in a query
+engine. The idea is deceptively simple: if a filter depends only on
+columns from one side of a join, move it to <em>that side</em> before
+the join happens. Fewer input rows means less work for the join, less
+memory for the hash table, and less data flowing through every node above.
+</p>
+
+<p>
+But you can't just blindly shove filters downward. Each type of child
+node has different rules about what's safe. Let's build the logic
+piece by piece.
+</p>
+
+<h3>The key enabler: <code>required_columns()</code></h3>
+
+<p>
+Remember <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a> from Module 2? Every expression
+node knows which columns it needs:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Expressions know their dependencies</div>
+<pre><code><span class="cm"># col("region") == "EU"</span>
+<span class="cm"># └── required_columns() → {"region"}</span>
+
+<span class="cm"># (col("amount") > 100) & (col("region") == "EU")</span>
+<span class="cm"># └── required_columns() → {"amount", "region"}</span></code></pre>
+
+<p>
+This is the bridge between the two trees. The expression tree tells the
+optimizer which columns the filter needs. The plan tree tells the optimizer
+which columns each node <em>provides</em>. If the filter's required
+columns are a subset of a child node's input columns, the filter can be
+pushed past that node.
+</p>
+
+<p>
+Here's how <code>required_columns()</code> propagates through the
+expression AST — a quick refresher from Module 2:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> How required_columns propagates</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>:
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> {<span class="va">self</span>.<span class="va">name</span>}          <span class="cm"># just this column</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>:
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="bi">set</span>()                <span class="cm"># constants need nothing</span>
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>:
+    <span class="kw">def</span> <span class="fn">required_columns</span>(<span class="va">self</span>):
+        <span class="kw">return</span> <span class="va">self</span>.<span class="va">left</span>.<span class="fn">required_columns</span>() <span class="op">|</span> <span class="va">self</span>.<span class="va">right</span>.<span class="fn">required_columns</span>()</code></pre>
+
+<p>
+The <code>|</code> operator is set union — the <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a>
+needs whatever its left side needs plus whatever its right side needs.
+This propagation is what makes filter pushdown possible. Without it,
+the optimizer would have no way to know which columns a filter touches.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">This is why lambdas had to die</div>
+  Remember Module 1, Lesson 1.4? We showed that lambda-based filters
+  are opaque — <code>lambda row: row["region"] == "EU"</code> gives the
+  optimizer no way to inspect which columns it accesses. That's why we
+  built the entire expression AST. This moment — filter pushdown — is
+  the payoff. The expression is <em>data</em>, so the optimizer can
+  call <code>.required_columns()</code> and make intelligent decisions.
+</div>
+
+<h3>The pushdown logic: <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_try_push_filter" class="source-link" target="_blank" rel="noopener"><code>_try_push_filter</code></a></h3>
+
+<p>
+Now for the core algorithm. When the recursive walk finds a
+<code>FilterNode</code>, it calls <code>_try_push_filter</code> with
+the filter's predicate and the (already-recursed) child node. This method
+asks: "Can I push this filter past this child? If so, do it. If not,
+leave it in place."
+</p>
+
+<p>
+Let's build the rules one child type at a time.
+</p>
+
+<h3>Rule 1: Pushing past <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a></h3>
+
+<p>
+A <code>ProjectNode</code> selects or reorders columns. If the filter
+only needs columns that exist <em>below</em> the project (in its child's
+schema), we can safely push the filter underneath:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Pushing a filter past a projection</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, <span class="cl">ProjectNode</span>) <span class="kw">and</span> <span class="va">child</span>.<span class="va">_columns</span>:
+    <span class="va">child_has</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">child</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+    <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">child_has</span>:
+        <span class="va">pushed</span> <span class="op">=</span> <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">child</span>, <span class="va">predicate</span>)
+        <span class="kw">return</span> <span class="cl">ProjectNode</span>(<span class="va">pushed</span>, <span class="va">child</span>.<span class="va">_columns</span>, <span class="va">child</span>.<span class="va">_exprs</span>)</code></pre>
+
+<p>
+The key line is <code>needed &lt;= child_has</code>. This is Python's
+set subset operator — it checks whether <em>every</em> column the filter
+needs exists in the project's input. If yes, we create a new
+<code>FilterNode</code> underneath the <code>ProjectNode</code>, and
+wrap it back up in a new <code>ProjectNode</code>. If not, the filter
+stays where it is.
+</p>
+
+<div class="before-after">
+  <div class="before-after-panel">
+    <h4><span class="tag tag-before">Before</span></h4>
+    <pre><code><span class="filter-node">Filter</span> [region == 'EU']
+  <span class="node">Project</span> [order_id, region, amount]
+    <span class="node">Scan</span> [...]</code></pre>
+  </div>
+  <div class="before-after-panel">
+    <h4><span class="tag tag-after">After</span></h4>
+    <pre><code><span class="node">Project</span> [order_id, region, amount]
+  <span class="pushed">Filter</span> [region == 'EU']
+    <span class="node">Scan</span> [...]</code></pre>
+  </div>
+</div>
+
+<h3>Rule 2: Pushing into <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a></h3>
+
+<p>
+This is the high-value rule — the one that makes the biggest difference
+in real pipelines. A <code>JoinNode</code> has two children (left and
+right), and each has its own set of columns. The optimizer checks: does
+the filter's required columns come entirely from the left side? Or
+entirely from the right?
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Pushing a filter into a join branch</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, <span class="cl">JoinNode</span>):
+    <span class="va">left_cols</span>  <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">left</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+    <span class="va">right_cols</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">right</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+
+    <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">left_cols</span>:
+        <span class="kw">return</span> <span class="cl">JoinNode</span>(
+            <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">left</span>, <span class="va">predicate</span>),  <span class="cm"># push into left</span>
+            <span class="va">child</span>.<span class="va">right</span>,
+            <span class="va">child</span>.<span class="va">left_on</span>, <span class="va">child</span>.<span class="va">right_on</span>, <span class="va">child</span>.<span class="va">how</span>,
+        )
+    <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">right_cols</span>:
+        <span class="kw">return</span> <span class="cl">JoinNode</span>(
+            <span class="va">child</span>.<span class="va">left</span>,
+            <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">right</span>, <span class="va">predicate</span>),  <span class="cm"># push into right</span>
+            <span class="va">child</span>.<span class="va">left_on</span>, <span class="va">child</span>.<span class="va">right_on</span>, <span class="va">child</span>.<span class="va">how</span>,
+        )</code></pre>
+
+<p>
+If the filter needs <code>{"region"}</code> and <code>region</code>
+comes from the left table, we wrap the left child in a new
+<code>FilterNode</code> and rebuild the <code>JoinNode</code> with
+the filtered left branch. The right branch is untouched.
+</p>
+
+<p>
+If the filter needs columns from <em>both</em> sides (e.g.,
+<code>col("left_price") > col("right_price")</code>), neither subset
+check passes, and the filter stays above the join. This is correct — you
+can't evaluate a cross-table predicate on a single side.
+</p>
+
+<div class="before-after">
+  <div class="before-after-panel">
+    <h4><span class="tag tag-before">Before</span></h4>
+    <pre><code><span class="filter-node">Filter</span> [region == 'EU']
+  <span class="filter-node">Filter</span> [segment == 'Ent']
+    <span class="node">Join</span> [inner]
+      <span class="node">Scan</span>(orders)
+      <span class="node">Scan</span>(customers)</code></pre>
+  </div>
+  <div class="before-after-panel">
+    <h4><span class="tag tag-after">After</span></h4>
+    <pre><code><span class="node">Join</span> [inner]
+  <span class="pushed">Filter</span> [region == 'EU']
+    <span class="node">Scan</span>(orders)
+  <span class="pushed">Filter</span> [segment == 'Ent']
+    <span class="node">Scan</span>(customers)</code></pre>
+  </div>
+</div>
+
+<p>
+Look what happened — two filters that were stacked above the join got
+pushed into <em>different</em> branches. <code>region</code> belongs
+to the orders table (left), <code>segment</code> belongs to the
+customers table (right). The optimizer figured this out using
+<code>required_columns()</code> and the schema of each branch.
+</p>
+
+<h3>Rule 3: Aggregation and sort boundaries</h3>
+
+<p>
+Not every node is safe to push past. Consider <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" class="source-link" target="_blank" rel="noopener"><code>AggNode</code></a>: if
+you push a filter below an aggregation, you change <em>which rows get
+aggregated</em>, which changes the result. A filter on a group-by key is
+safe though — filtering by <code>region == 'EU'</code> before grouping by
+<code>region</code> doesn't change the groups, it just removes one:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Pushing past aggregation — only on group keys</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, (<span class="cl">AggNode</span>, <span class="cl">SortedAggNode</span>)):
+    <span class="va">group_keys</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">group_by</span>)
+    <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">group_keys</span>:
+        <span class="va">pushed</span> <span class="op">=</span> <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">child</span>, <span class="va">predicate</span>)
+        <span class="kw">return</span> <span class="bi">type</span>(<span class="va">child</span>)(<span class="va">pushed</span>, <span class="va">child</span>.<span class="va">group_by</span>, <span class="va">child</span>.<span class="va">agg_exprs</span>)</code></pre>
+
+<p>
+If the filter only references group-by keys (like filtering on
+<code>region</code> after <code>group_by("region")</code>), it's safe
+to push because the group boundaries don't change — you're just
+removing entire groups. But a filter on an aggregated result like
+<code>total > 1000</code> can't be pushed down because <code>total</code>
+doesn't exist in the child's output yet — the subset check fails and
+the filter stays above. Notice the elegant use
+of <code>type(child)(...)</code> — this works for both
+<code>AggNode</code> and <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" class="source-link" target="_blank" rel="noopener"><code>SortedAggNode</code></a> since they share
+the same constructor signature.
+</p>
+
+<h3>The fallback</h3>
+
+<p>
+If none of the rules match — the child is a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" class="source-link" target="_blank" rel="noopener"><code>SortNode</code></a>, a
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a>, or any node type the optimizer doesn't have a
+special rule for — the filter stays where it is:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> When nothing matches, leave the filter in place</div>
+<pre><code><span class="cm"># If no rule matched, keep the filter above the child</span>
+<span class="kw">return</span> <span class="cl">FilterNode</span>(<span class="va">child</span>, <span class="va">predicate</span>)</code></pre>
+
+<p>
+This is the conservative default. An optimizer should never change the
+semantics of a query — if it's not <em>sure</em> a rewrite is safe,
+it does nothing. The query still produces correct results; it just
+doesn't get this particular optimization.
+</p>
+
+<h3>The complete pushdown rules</h3>
+
+<table class="rule-table">
+  <tr>
+    <th>Child Node</th>
+    <th>Rule</th>
+    <th>Safety Check</th>
+  </tr>
+  <tr>
+    <td><code>ProjectNode</code></td>
+    <td>Push filter below the projection</td>
+    <td>Filter columns exist in project's input</td>
+  </tr>
+  <tr>
+    <td><code>JoinNode</code></td>
+    <td>Push into the branch that owns the columns</td>
+    <td>All filter columns come from one side</td>
+  </tr>
+  <tr>
+    <td><code>AggNode</code></td>
+    <td>Push below aggregation</td>
+    <td>Filter only references group-by keys</td>
+  </tr>
+  <tr>
+    <td><code>PivotNode</code></td>
+    <td>Push below pivot</td>
+    <td>Filter only references index columns</td>
+  </tr>
+  <tr>
+    <td><code>UnpivotNode</code></td>
+    <td>Push below unpivot</td>
+    <td>Filter only references id columns</td>
+  </tr>
+  <tr>
+    <td>Everything else</td>
+    <td>Leave in place</td>
+    <td>—</td>
+  </tr>
+</table>
+
+<div class="aside callout-teal">
+  <div class="aside-title">In the wild</div>
+  In Polars, <code>lf.explain(optimized=True)</code> shows this in action.
+  Polars calls it "predicate pushdown" — the concept is identical.
+  Spark's Catalyst has the same pass, extended to handle <code>UNION</code>
+  and subqueries.
+</div>
+
+<p>
+Now let's look at pyfloe's complete implementation. It handles a few more
+node types than our simplified version, but the structure is identical:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's _push_filters — the full recursive walk</div>
+<pre><code><span class="kw">def</span> <span class="fn">_push_filters</span>(<span class="va">self</span>, <span class="va">node</span>: <span class="cl">PlanNode</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">FilterNode</span>):
+        <span class="va">child</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>)
+        <span class="kw">return</span> <span class="va">self</span>.<span class="fn">_try_push_filter</span>(<span class="va">node</span>.<span class="va">predicate</span>, <span class="va">child</span>)
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">ProjectNode</span>):
+        <span class="kw">return</span> <span class="cl">ProjectNode</span>(<span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>), <span class="va">node</span>.<span class="va">_columns</span>, <span class="va">node</span>.<span class="va">_exprs</span>)
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">JoinNode</span>):
+        <span class="kw">return</span> <span class="cl">JoinNode</span>(
+            <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">left</span>),
+            <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">right</span>),
+            <span class="va">node</span>.<span class="va">left_on</span>, <span class="va">node</span>.<span class="va">right_on</span>, <span class="va">node</span>.<span class="va">how</span>,
+        )
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">SortNode</span>):
+        <span class="kw">return</span> <span class="cl">SortNode</span>(<span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>), <span class="va">node</span>.<span class="va">by</span>, <span class="va">node</span>.<span class="va">ascending</span>)
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">WithColumnNode</span>):
+        <span class="kw">return</span> <span class="cl">WithColumnNode</span>(<span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>), <span class="va">node</span>.<span class="va">_name</span>, <span class="va">node</span>.<span class="va">_expr</span>)
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, (<span class="cl">AggNode</span>, <span class="cl">SortedAggNode</span>)):
+        <span class="kw">return</span> <span class="bi">type</span>(<span class="va">node</span>)(<span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">node</span>.<span class="va">child</span>), <span class="va">node</span>.<span class="va">group_by</span>, <span class="va">node</span>.<span class="va">agg_exprs</span>)
+    <span class="cm"># PivotNode, UnpivotNode — same recurse-and-rebuild pattern</span>
+    <span class="kw">return</span> <span class="va">node</span></code></pre>
+
+<p>
+And here's the full <code>_try_push_filter</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's _try_push_filter — the decision logic</div>
+<pre><code><span class="kw">def</span> <span class="fn">_try_push_filter</span>(<span class="va">self</span>, <span class="va">predicate</span>: <span class="cl">Expr</span>, <span class="va">child</span>: <span class="cl">PlanNode</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+    <span class="va">needed</span> <span class="op">=</span> <span class="va">predicate</span>.<span class="fn">required_columns</span>()
+
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, <span class="cl">ProjectNode</span>) <span class="kw">and</span> <span class="va">child</span>.<span class="va">_columns</span>:
+        <span class="va">child_has</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">child</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+        <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">child_has</span>:
+            <span class="kw">return</span> <span class="cl">ProjectNode</span>(<span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">child</span>, <span class="va">predicate</span>), <span class="va">child</span>.<span class="va">_columns</span>, <span class="va">child</span>.<span class="va">_exprs</span>)
+
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, (<span class="cl">AggNode</span>, <span class="cl">SortedAggNode</span>)):
+        <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">group_by</span>):
+            <span class="kw">return</span> <span class="bi">type</span>(<span class="va">child</span>)(<span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">child</span>, <span class="va">predicate</span>), <span class="va">child</span>.<span class="va">group_by</span>, <span class="va">child</span>.<span class="va">agg_exprs</span>)
+
+    <span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">child</span>, <span class="cl">JoinNode</span>):
+        <span class="va">left_cols</span>  <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">left</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+        <span class="va">right_cols</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">child</span>.<span class="va">right</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+        <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">left_cols</span>:
+            <span class="kw">return</span> <span class="cl">JoinNode</span>(
+                <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">left</span>, <span class="va">predicate</span>), <span class="va">child</span>.<span class="va">right</span>,
+                <span class="va">child</span>.<span class="va">left_on</span>, <span class="va">child</span>.<span class="va">right_on</span>, <span class="va">child</span>.<span class="va">how</span>)
+        <span class="kw">if</span> <span class="va">needed</span> <span class="op">&lt;=</span> <span class="va">right_cols</span>:
+            <span class="kw">return</span> <span class="cl">JoinNode</span>(
+                <span class="va">child</span>.<span class="va">left</span>, <span class="cl">FilterNode</span>(<span class="va">child</span>.<span class="va">right</span>, <span class="va">predicate</span>),
+                <span class="va">child</span>.<span class="va">left_on</span>, <span class="va">child</span>.<span class="va">right_on</span>, <span class="va">child</span>.<span class="va">how</span>)
+
+    <span class="cm"># PivotNode, UnpivotNode — same subset-check pattern</span>
+
+    <span class="kw">return</span> <span class="cl">FilterNode</span>(<span class="va">child</span>, <span class="va">predicate</span>)  <span class="cm"># fallback</span></code></pre>
+
+<p>
+That's the entire filter pushdown implementation. Two methods, about
+50 lines of code. The complexity isn't in the code — it's in understanding
+<em>which</em> rewrites are safe and <em>why</em>. Every rule boils down
+to one question: "Does the filter's <code>required_columns()</code>
+fit within the columns available at the target location?"
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The subset operator is doing all the work</div>
+  Count how many times <code>&lt;=</code> appears in this code. Every
+  pushdown decision is a set-subset check. Python's <code>set</code>
+  class gives us <code>&lt;=</code> (subset), <code>|</code> (union),
+  and <code>&amp;</code> (intersection) — and those three operations are
+  the entire mathematical vocabulary of filter pushdown. The expression
+  AST provides <code>required_columns()</code> as a set. The schema
+  provides <code>column_names</code> as a set. The optimizer is just
+  comparing sets.
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 5.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Lesson 5.4</span>
+  Column Pruning
+</h2>
+
+<p>
+Filter pushdown reduces the number of <em>rows</em>. Column pruning
+reduces the width of each row — how many values it carries. If your
+pipeline ends with <code>.select("order_id", "name", "amount")</code>,
+why should the engine carry <code>date</code>, <code>segment</code>,
+<code>internal_notes</code>, and 15 other columns through every node?
+</p>
+
+<p>
+Column pruning walks the tree top-down, tracking which columns are
+<em>actually needed</em> at each level. When it reaches a
+<code>ScanNode</code>, it inserts a <code>ProjectNode</code> to
+discard unused columns right at the source — before any data flows.
+</p>
+
+<h3>The approach: propagate "needed" sets downward</h3>
+
+<p>
+The algorithm starts at the root and asks: "What columns does the
+output need?" Then it walks down the tree, and at each node, it
+computes: "Given what my parent needs, what do <em>I</em> need from my
+child?" Each node type has its own rule for this computation.
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> The pruning entry point</div>
+<pre><code><span class="kw">def</span> <span class="fn">optimize</span>(<span class="va">self</span>, <span class="va">plan</span>: <span class="cl">PlanNode</span>) <span class="op">-></span> <span class="cl">PlanNode</span>:
+    <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_push_filters</span>(<span class="va">plan</span>)       <span class="cm"># pass 1</span>
+    <span class="va">needed</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">plan</span>.<span class="fn">schema</span>().<span class="va">column_names</span>) <span class="cm"># root's output columns</span>
+    <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">plan</span>, <span class="va">needed</span>) <span class="cm"># pass 2</span>
+    <span class="kw">return</span> <span class="va">plan</span></code></pre>
+
+<p>
+The initial <code>needed</code> set is the root's output columns — whatever
+the final <code>ProjectNode</code> or <code>ScanNode</code> at the top
+produces. This set flows downward through the tree, expanding at each node
+to include whatever extra columns that node requires.
+</p>
+
+<h3>Pruning at <code>ScanNode</code> — the payoff</h3>
+
+<p>
+The simplest and most impactful rule: when we reach a
+<code>ScanNode</code>, compare what it provides to what's actually needed.
+If there are unused columns, insert a <code>ProjectNode</code> to strip
+them:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Pruning at the data source</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">ScanNode</span>):
+    <span class="va">available</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">_columns</span>)
+    <span class="va">prune_to</span> <span class="op">=</span> [<span class="va">c</span> <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">node</span>.<span class="va">_columns</span> <span class="kw">if</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">needed</span>]
+    <span class="kw">if</span> <span class="bi">len</span>(<span class="va">prune_to</span>) <span class="op">&lt;</span> <span class="bi">len</span>(<span class="va">available</span>) <span class="kw">and</span> <span class="va">prune_to</span>:
+        <span class="kw">return</span> <span class="cl">ProjectNode</span>(<span class="va">node</span>, <span class="va">prune_to</span>)
+    <span class="kw">return</span> <span class="va">node</span></code></pre>
+
+<p>
+Two details are worth noting. First, the list comprehension preserves the
+original column order — <code>[c for c in node._columns if c in needed]</code>
+iterates over the scan's columns, not the needed set, so the output order
+is deterministic. Second, the guard <code>prune_to</code> (truthy if
+non-empty) prevents inserting an empty projection that would discard all
+columns.
+</p>
+
+<h3>Expanding the needed set at each node</h3>
+
+<p>
+As the algorithm walks down the tree, each node type may <em>add</em>
+columns to the needed set. A <code>FilterNode</code> needs whatever
+its parent needs <em>plus</em> the columns its predicate references:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> FilterNode expands the needed set</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">FilterNode</span>):
+    <span class="va">filter_needs</span> <span class="op">=</span> <span class="va">node</span>.<span class="va">predicate</span>.<span class="fn">required_columns</span>()
+    <span class="kw">return</span> <span class="cl">FilterNode</span>(
+        <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">node</span>.<span class="va">child</span>, <span class="va">needed</span> <span class="op">|</span> <span class="va">filter_needs</span>),
+        <span class="va">node</span>.<span class="va">predicate</span>,
+    )</code></pre>
+
+<p>
+The <code>|</code> is set union — the child of a <code>FilterNode</code>
+must provide both the columns the parent needs <em>and</em> the columns
+the filter evaluates. This is <code>required_columns()</code> doing its
+job again — the same method that powered filter pushdown now drives
+column pruning.
+</p>
+
+<h3>Splitting needs at <code>JoinNode</code></h3>
+
+<p>
+Joins are the most interesting case. A join's output is the combination
+of left and right columns. The pruner needs to figure out which needed
+columns come from the left side and which from the right — then tell each
+child to keep only its portion, plus the join keys:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Splitting needs across a join</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">JoinNode</span>):
+    <span class="va">left_cols</span>  <span class="op">=</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">left</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+    <span class="va">right_cols</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">right</span>.<span class="fn">schema</span>().<span class="va">column_names</span>)
+    <span class="va">left_needed</span>  <span class="op">=</span> (<span class="va">needed</span> <span class="op">&amp;</span> <span class="va">left_cols</span>)  <span class="op">|</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">left_on</span>)
+    <span class="va">right_needed</span> <span class="op">=</span> (<span class="va">needed</span> <span class="op">&amp;</span> <span class="va">right_cols</span>) <span class="op">|</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">right_on</span>)
+    <span class="kw">return</span> <span class="cl">JoinNode</span>(
+        <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">node</span>.<span class="va">left</span>, <span class="va">left_needed</span>),
+        <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">node</span>.<span class="va">right</span>, <span class="va">right_needed</span>),
+        <span class="va">node</span>.<span class="va">left_on</span>, <span class="va">node</span>.<span class="va">right_on</span>, <span class="va">node</span>.<span class="va">how</span>,
+    )</code></pre>
+
+<p>
+Three set operations in two lines tell the whole story.
+<code>needed &amp; left_cols</code> is set intersection — which of the
+downstream-needed columns come from the left side? We union that with the
+join keys (<code>node.left_on</code>) because the join <em>always</em>
+needs its keys, even if no downstream node references them. Same logic
+for the right side.
+</p>
+
+<h3>The <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" class="source-link" target="_blank" rel="noopener"><code>WithColumnNode</code></a> case</h3>
+
+<p>
+<code>WithColumnNode</code> computes a new column from an expression.
+Its child doesn't need the <em>output</em> column (it doesn't exist yet),
+but it <em>does</em> need whatever columns the expression references:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> WithColumnNode — subtract output, add expression deps</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">WithColumnNode</span>):
+    <span class="va">expr_needs</span> <span class="op">=</span> <span class="va">node</span>.<span class="va">_expr</span>.<span class="fn">required_columns</span>()
+    <span class="va">child_needed</span> <span class="op">=</span> (<span class="va">needed</span> <span class="op">-</span> {<span class="va">node</span>.<span class="va">_name</span>}) <span class="op">|</span> <span class="va">expr_needs</span>
+    <span class="kw">return</span> <span class="cl">WithColumnNode</span>(
+        <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">node</span>.<span class="va">child</span>, <span class="va">child_needed</span>),
+        <span class="va">node</span>.<span class="va">_name</span>, <span class="va">node</span>.<span class="va">_expr</span>,
+    )</code></pre>
+
+<p>
+<code>needed - {node._name}</code> removes the computed column name (it
+doesn't exist in the child's output). <code>| expr_needs</code> adds the
+columns the expression reads. So if <code>WithColumnNode</code> computes
+<code>tax = amount * 0.2</code>, the child needs <code>amount</code> but
+not <code>tax</code>.
+</p>
+
+<h3>Aggregation — a natural boundary</h3>
+
+<p>
+<code>AggNode</code> is a natural pruning boundary. Its output is the
+group-by keys plus the aggregation results. Its <em>input</em> needs
+the group-by keys plus whatever columns the aggregate expressions read:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's AggNode pruning</div>
+<pre><code><span class="kw">if</span> <span class="bi">isinstance</span>(<span class="va">node</span>, <span class="cl">AggNode</span>):
+    <span class="va">child_needed</span> <span class="op">=</span> <span class="bi">set</span>(<span class="va">node</span>.<span class="va">group_by</span>)
+    <span class="kw">for</span> <span class="va">agg</span> <span class="kw">in</span> <span class="va">node</span>.<span class="va">agg_exprs</span>:
+        <span class="va">child_needed</span> <span class="op">|=</span> <span class="va">agg</span>.<span class="fn">required_columns</span>()
+    <span class="kw">return</span> <span class="cl">AggNode</span>(
+        <span class="va">self</span>.<span class="fn">_prune_columns</span>(<span class="va">node</span>.<span class="va">child</span>, <span class="va">child_needed</span>),
+        <span class="va">node</span>.<span class="va">group_by</span>, <span class="va">node</span>.<span class="va">agg_exprs</span>,
+    )</code></pre>
+
+<p>
+Notice that <code>child_needed</code> here is computed entirely from the
+<code>AggNode</code>'s own parameters — it ignores the <code>needed</code>
+set from above. That's because aggregation completely reshapes the data:
+the child's columns bear no direct relation to the parent's columns. The
+aggregation itself determines what it needs.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The two-pass interaction</div>
+  Filter pushdown and column pruning are designed to compose. After
+  pushdown moves filters closer to the source, column pruning sees a
+  <em>simpler</em> tree to work with — potentially with fewer nodes
+  between the scan and the root. The pushed-down filters also expand
+  the needed-column set at the right level, ensuring that filter
+  columns don't get pruned too early. Running pushdown first, then
+  pruning, is a deliberate design choice.
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 5.5 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-5">
+  <span class="lesson-num">Lesson 5.5</span>
+  Seeing the Difference
+</h2>
+
+<p>
+Let's bring it all together. Here's a realistic pipeline — the kind
+a data engineer writes every day:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> A pipeline with optimization potential</div>
+<pre><code><span class="va">orders</span> <span class="op">=</span> <span class="cl">LazyFrame</span>([
+    {<span class="st">"order_id"</span>: <span class="nu">1</span>, <span class="st">"customer_id"</span>: <span class="nu">101</span>, <span class="st">"amount"</span>: <span class="nu">250</span>,
+     <span class="st">"date"</span>: <span class="st">"2024-01-15"</span>, <span class="st">"region"</span>: <span class="st">"EU"</span>, <span class="st">"notes"</span>: <span class="st">"..."</span>},
+    <span class="cm"># ... thousands more rows, 6 columns each</span>
+])
+
+<span class="va">customers</span> <span class="op">=</span> <span class="cl">LazyFrame</span>([
+    {<span class="st">"customer_id"</span>: <span class="nu">101</span>, <span class="st">"name"</span>: <span class="st">"Alice"</span>,
+     <span class="st">"segment"</span>: <span class="st">"Enterprise"</span>, <span class="st">"tier"</span>: <span class="st">"Gold"</span>},
+    <span class="cm"># ... hundreds of customers, 4 columns each</span>
+])
+
+<span class="va">pipeline</span> <span class="op">=</span> (
+    <span class="va">orders</span>
+    .<span class="fn">join</span>(<span class="va">customers</span>, <span class="va">on</span><span class="op">=</span><span class="st">"customer_id"</span>)
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"region"</span>) <span class="op">==</span> <span class="st">"EU"</span>)
+    .<span class="fn">filter</span>(<span class="fn">col</span>(<span class="st">"segment"</span>) <span class="op">==</span> <span class="st">"Enterprise"</span>)
+    .<span class="fn">select</span>(<span class="st">"order_id"</span>, <span class="st">"name"</span>, <span class="st">"amount"</span>)
+)</code></pre>
+
+<p>
+Now let's see what <code>.explain()</code> reveals — before and after:
+</p>
+
+<div class="before-after">
+  <div class="before-after-panel">
+    <h4><span class="tag tag-before">pipeline.explain()</span></h4>
+    <pre><code><span class="node">Project</span> [order_id, name, amount]
+  <span class="filter-node">Filter</span> [segment == 'Enterprise']
+    <span class="filter-node">Filter</span> [region == 'EU']
+      <span class="node">Join</span> [inner] on customer_id
+        <span class="node">Scan</span> [6 cols] (N rows)
+        <span class="node">Scan</span> [4 cols] (M rows)</code></pre>
+  </div>
+  <div class="before-after-panel">
+    <h4><span class="tag tag-after">pipeline.explain(optimized=True)</span></h4>
+    <pre><code><span class="node">Project</span> [order_id, name, amount]
+  <span class="node">Join</span> [inner] on customer_id
+    <span class="pushed">Filter</span> [region == 'EU']
+      <span class="pruned">Project</span> [order_id, customer_id,
+              amount]
+        <span class="node">Scan</span> (N rows)
+    <span class="pushed">Filter</span> [segment == 'Enterprise']
+      <span class="pruned">Project</span> [customer_id, name]
+        <span class="node">Scan</span> (M rows)</code></pre>
+  </div>
+</div>
+
+<p>
+Count the changes:
+</p>
+
+<p>
+<strong>Filter pushdown:</strong> <code>region == 'EU'</code> was pushed
+into the left branch (orders), because <code>region</code> is an orders
+column. <code>segment == 'Enterprise'</code> was pushed into the right
+branch (customers), because <code>segment</code> is a customers column.
+The join now operates on pre-filtered data from <em>both</em> sides.
+</p>
+
+<p>
+<strong>Column pruning:</strong> The left scan originally carried 6
+columns; now it carries 3 (<code>order_id</code>, <code>customer_id</code>,
+<code>amount</code>). The right scan originally carried 4 columns; now it
+carries 2 (<code>customer_id</code>, <code>name</code>). Everything the
+pipeline doesn't need — <code>date</code>, <code>notes</code>,
+<code>tier</code> — is stripped at the source.
+</p>
+
+<h3>Why this matters in practice</h3>
+
+<p>
+The impact is multiplicative. Suppose the orders table has 100,000 rows
+and the EU filter reduces that to 30,000. The customers table has 5,000
+rows and the Enterprise filter reduces that to 800.
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-before">Without optimizer</span></h4>
+    <p>
+      The join builds a hash table of 5,000 customers (4 cols each), then
+      probes it with 100,000 orders (6 cols each). After the join, the
+      two filters run on 100,000+ joined rows carrying 10 columns. The
+      project at the top finally strips columns.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-after">With optimizer</span></h4>
+    <p>
+      The left filter reduces orders to 30,000 rows (3 cols). The right
+      filter reduces customers to 800 rows (2 cols). The join builds a hash
+      table of 800 rows — not 5,000. It probes with 30,000 rows — not
+      100,000. Less memory, less CPU, same result.
+    </p>
+  </div>
+</div>
+
+<p>
+For large pipelines, these optimizations can be the difference between a
+query taking seconds and taking minutes. And the user's code didn't change
+at all — they wrote the pipeline in whatever order felt natural, and the
+optimizer silently rewrote it to be efficient.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">Show the magic</div>
+  This is exactly what happens when you write a Polars pipeline and call
+  <code>.collect()</code>. Polars runs predicate pushdown, projection
+  pushdown (column pruning), and several other optimization passes
+  before executing anything. You can see it with
+  <code>lf.explain(optimized=True)</code>. Spark does the same in its
+  Catalyst optimizer — and now you understand the fundamental mechanism
+  behind both. You built it.
+</div>
+
+<h3>The full optimizer, in perspective</h3>
+
+<p>
+Let's take stock of what the <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20Optimizer" class="source-link" target="_blank" rel="noopener"><code>Optimizer</code></a> class actually is.
+It's about 80 lines of code — three methods. <code>optimize()</code>
+coordinates the two passes. <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_push_filters" class="source-link" target="_blank" rel="noopener"><code>_push_filters()</code></a> walks the tree
+top-down, and for every <code>FilterNode</code> it finds, delegates to
+<code>_try_push_filter()</code> which uses subset checks on
+<code>required_columns()</code> to decide where the filter can go.
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_prune_columns" class="source-link" target="_blank" rel="noopener"><code>_prune_columns()</code></a> walks the tree top-down with a
+<code>needed</code> set, expanding it at each node, and inserts
+<code>ProjectNode</code>s at <code>ScanNode</code>s to strip unused
+columns.
+</p>
+
+<p>
+Two recursive walks. A handful of <code>isinstance</code> checks.
+Set operations — <code>&lt;=</code>, <code>|</code>, <code>&amp;</code>,
+<code>-</code>. And <code>required_columns()</code>, the method you built
+in Module 2, is the thread that ties everything together. That's all
+it takes.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">What pyfloe adds beyond our simplified version</div>
+  pyfloe's actual optimizer handles a few more node types than we walked
+  through in detail: <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PivotNode" class="source-link" target="_blank" rel="noopener"><code>PivotNode</code></a>, <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20UnpivotNode" class="source-link" target="_blank" rel="noopener"><code>UnpivotNode</code></a>,
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WindowNode" class="source-link" target="_blank" rel="noopener"><code>WindowNode</code></a>. The pattern is identical in every case —
+  check whether the filter's columns fit, or compute the needed set for
+  the child. pyfloe also handles <code>right_</code>-prefixed columns
+  in join pruning (for disambiguating columns that appear on both sides
+  of a join). These are refinements, not new concepts.
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<div class="interactive-box">
+  <h4>Quick check</h4>
+
+  <div id="quiz">
+    <div id="q1" class="quiz-question">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        1. Why can't an eager engine support query optimization?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">Eager engines don't have plan trees</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, true)">The data is already flowing — there's no plan to rewrite</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">Eager engines can't use expressions</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">Eager engines are too fast to need it</button>
+      </div>
+      <div id="feedback-1" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q2" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        2. A filter uses <code>col("amount") > 100</code>. The child is a JoinNode where <code>amount</code> exists in the left schema. What happens?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, true)">The filter is pushed into the left branch</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">The filter is pushed into both branches</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">The filter stays above the join</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">It depends on the join type</button>
+      </div>
+      <div id="feedback-2" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q3" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        3. What does <code>required_columns()</code> return for <code>col("price") * lit(0.2)</code>?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, true)">{"price"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">{"price", "0.2"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">set()</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">{"price", "lit"}</button>
+      </div>
+      <div id="feedback-3" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q4" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        4. In column pruning, what does the child of <code>WithColumnNode(tax = amount * 0.2)</code> need?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">{"tax", "amount"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, true)">(needed - {"tax"}) | {"amount"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">Just {"amount"}</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">The same set as the parent needs</button>
+      </div>
+      <div id="feedback-4" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q5" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        5. Why does pyfloe run filter pushdown <em>before</em> column pruning?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Column pruning depends on filter positions</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, true)">Pushdown reduces rows first; pruning then reduces columns — multiplicative savings</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">The order doesn't actually matter</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">Column pruning can break filter pushdown</button>
+      </div>
+      <div id="feedback-5" class="output-box" style="display: none;"></div>
+    </div>
+  </div>
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- CLIFFHANGER / COURSE ENDING -->
+<!-- ============================================================ -->
+
+<div class="source-references">
+  <h2>Source References</h2>
+  <div class="source-ref-group">
+    <h4>plan.py &mdash; Plan Nodes &amp; Optimizer</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener">ProjectNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener">JoinNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" target="_blank" rel="noopener">AggNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" target="_blank" rel="noopener">SortedAggNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" target="_blank" rel="noopener">SortNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" target="_blank" rel="noopener">WithColumnNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PivotNode" target="_blank" rel="noopener">PivotNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20UnpivotNode" target="_blank" rel="noopener">UnpivotNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WindowNode" target="_blank" rel="noopener">WindowNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20Optimizer" target="_blank" rel="noopener">Optimizer</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20optimize" target="_blank" rel="noopener">optimize()</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_push_filters" target="_blank" rel="noopener">_push_filters()</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_try_push_filter" target="_blank" rel="noopener">_try_push_filter()</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_prune_columns" target="_blank" rel="noopener">_prune_columns()</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>core.py &mdash; LazyFrame API</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener">LazyFrame</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>expr.py &mdash; Expression AST</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener">BinaryExpr</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" target="_blank" rel="noopener">required_columns()</a></li>
+    </ul>
+  </div>
+</div>
+
+<div class="aside callout-purple">
+  <div class="aside-title">You built a query engine</div>
+  Take a moment to appreciate what you've done across these five modules.
+  You started with Python lists and generators. You built an expression
+  AST with operator overloading. You connected it to a volcano-model
+  execution engine with batched processing and schema propagation.
+  You implemented hash joins and hash aggregation. And now you've
+  written an optimizer that rewrites plan trees for efficiency — using
+  the architecture that powers Polars, Spark, and every serious
+  database engine in production today.
+  <br><br>
+  But this is a <em>pure Python</em> engine. The real world wants more.
+  What if you could process batches across multiple CPU cores? What if
+  you could stream results to disk without ever holding the full dataset
+  in memory? What if you rewrote the hot loops in Rust or C? Those are
+  the questions that separate a teaching engine from a production one —
+  and they're exactly where you go next.
+</div>
+
+<script>
+const answers = {
+  1: {
+    correct: "Exactly. An optimizer rewrites a plan before execution begins. An eager engine runs each operation immediately — there's no plan to rewrite. Lazy execution builds the plan first, giving the optimizer its window.",
+    wrong: "Not quite. An optimizer rewrites the plan *before* execution. In an eager engine, each operation runs immediately — there's no plan to rewrite. Lazy execution builds the entire plan tree first."
+  },
+  2: {
+    correct: "Right. required_columns() returns {'amount'}. The optimizer checks {'amount'} <= left_cols — it passes, so the filter is pushed into the left branch.",
+    wrong: "Not quite. required_columns() returns {'amount'}, which is a subset of the left schema. So the filter gets pushed into the left branch of the join."
+  },
+  3: {
+    correct: "Yes. Col('price') needs {'price'}, Lit(0.2) needs nothing. The union is {'price'}.",
+    wrong: "Not quite. Lit(0.2) returns set(). Col('price') returns {'price'}. The BinaryExpr union is {'price'} | set() = {'price'}."
+  },
+  4: {
+    correct: "Exactly. 'tax' doesn't exist in the child — subtract it. The expression reads 'amount' — add it. Formula: (needed - {'tax'}) | {'amount'}.",
+    wrong: "Not quite. 'tax' is computed by this node, not its child. Remove it from needed, add the expression's dependencies: (needed - {'tax'}) | {'amount'}."
+  },
+  5: {
+    correct: "Right. The savings are multiplicative. Filter pushdown reduces row counts first, then column pruning reduces column counts — total data processed is (fewer rows) × (fewer columns per row). Additionally, after pushdown moves filters closer to sources, the pruner operates on a cleaner tree and the pushed-down filters properly expand the needed-column set at the right level, preventing their required columns from being pruned too early.",
+    wrong: "Not quite. The order matters because the effects compound. Pushdown reduces row counts first, then pruning reduces column counts — so total data processed is (fewer rows) × (fewer columns per row). Also, pushed-down filters expand the needed-column set at the right tree level, ensuring that filter columns aren't accidentally pruned."
+  }
+};
+
+function checkAnswer(q, btn, correct) {
+  const feedback = document.getElementById('feedback-' + q);
+  const btns = btn.parentElement.querySelectorAll('.quiz-btn');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+  btn.style.opacity = '1';
+
+  if (correct) {
+    btn.style.borderColor = '#0F6E56';
+    btn.style.background = '#E1F5EE';
+    btn.style.color = '#0F6E56';
+    feedback.className = 'output-box';
+    feedback.textContent = answers[q].correct;
+  } else {
+    btn.style.borderColor = '#A32D2D';
+    btn.style.background = '#FCEBEB';
+    btn.style.color = '#A32D2D';
+    feedback.className = 'output-box error';
+    feedback.textContent = answers[q].wrong;
+  }
+  feedback.style.display = 'block';
+}
+</script>

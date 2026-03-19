@@ -1,0 +1,870 @@
+<h1>We Need to Talk<br>About <em>DataFrames</em></h1>
+
+<p class="subtitle">
+If you work with data in Python, you use DataFrames. They are the
+undisputed heavyweight of the data ecosystem. But have you ever stopped
+to ask <em>why</em> they are so dominant — or how they actually work
+under the hood?
+</p>
+
+<p>
+In this course, we aren't just going to <em>use</em> DataFrames. We are
+going to <strong>build our own</strong> — in pure Python,
+with zero external dependencies. By the end, you'll understand the deep
+Python magic that powers industry giants like Polars and PySpark.
+</p>
+
+<p>
+But first, we need to talk about why DataFrames exist in the first place.
+</p>
+
+<nav class="toc">
+  <div class="toc-title">In this module</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">1.1</span> The Ultimate Bridge to Excel</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">1.2</span> The Memory Trap: Eager vs. Lazy Execution</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">1.3</span> Unlocking Laziness: Generators and the Volcano Model</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">1.4</span> The Problem with Lambdas</a>
+</nav>
+
+<!-- ============================================================ -->
+<!-- LESSON 1.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Lesson 1.1</span>
+  The Ultimate Bridge to Excel
+</h2>
+
+<p>
+Native Python data structures are incredibly flexible, but they are
+terrible at tabular data. If you have a list of thousands of dictionaries
+representing user data, answering a simple question like <em>"What is the
+average age of users in Europe?"</em> requires writing clumsy for loops,
+managing accumulators, and handling missing keys.
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Raw Python — the clumsy way</div>
+<pre><code><span class="kw">import</span> csv
+
+<span class="cm"># Step 1: Read the CSV into a list of dicts</span>
+<span class="va">rows</span> <span class="op">=</span> []
+<span class="kw">with</span> <span class="bi">open</span>(<span class="st">"orders.csv"</span>) <span class="kw">as</span> <span class="va">f</span>:
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> csv.DictReader(<span class="va">f</span>):
+        <span class="va">rows</span>.append(<span class="va">row</span>)
+
+<span class="cm"># Step 2: Filter (everything is a string!)</span>
+<span class="va">filtered</span> <span class="op">=</span> [<span class="va">r</span> <span class="kw">for</span> <span class="va">r</span> <span class="kw">in</span> <span class="va">rows</span> <span class="kw">if</span> <span class="bi">float</span>(<span class="va">r</span>[<span class="st">"amount"</span>]) <span class="op">&gt;</span> <span class="nu">100</span>]
+
+<span class="cm"># Step 3: Group by region (manual accumulator)</span>
+<span class="va">groups</span> <span class="op">=</span> {}
+<span class="kw">for</span> <span class="va">r</span> <span class="kw">in</span> <span class="va">filtered</span>:
+    <span class="va">region</span> <span class="op">=</span> <span class="va">r</span>[<span class="st">"region"</span>]
+    <span class="va">groups</span>.setdefault(<span class="va">region</span>, <span class="nu">0</span>)
+    <span class="va">groups</span>[<span class="va">region</span>] <span class="op">+=</span> <span class="bi">float</span>(<span class="va">r</span>[<span class="st">"amount"</span>])
+
+<span class="bi">print</span>(<span class="va">groups</span>)
+<span class="cm"># {'EU': 45230.0, 'US': 89100.5, 'APAC': 23400.0}</span></code></pre>
+
+<p>
+It works. But count the problems: everything is a string (you're casting
+<code>float()</code> manually, in two different places — miss one and you
+get a silent bug), all data sits in memory at once, and each step is
+imperative plumbing with zero composability. Want to add a sort? That's
+another 5 lines.
+</p>
+
+<p>
+On the other hand, software like Excel or SQL makes tabular analysis
+beautifully intuitive. You can filter, group, and aggregate in seconds.
+But Excel can't easily be automated in a data pipeline, and SQL requires
+a database engine.
+</p>
+
+<p>
+The DataFrame is the bridge. It gives you the <span class="highlight">intuitive,
+tabular mental model of Excel</span>, wrapped in the programmatic power
+and automation capabilities of Python.
+</p>
+
+<h3>A brief history</h3>
+
+<div class="timeline">
+  <div class="timeline-item">
+    <div class="timeline-year">2008 — Pandas is born</div>
+    <div class="timeline-text">
+      Wes McKinney creates Pandas at AQR Capital. For the first time,
+      Python developers can manipulate tabular data with the fluency of
+      R or Excel. Pandas becomes the backbone of data science.
+    </div>
+  </div>
+  <div class="timeline-item">
+    <div class="timeline-year">2014 — Apache Spark goes mainstream</div>
+    <div class="timeline-text">
+      PySpark brings Spark's <strong>lazy execution</strong> model to
+      mainstream Python adoption. Operations build a plan; computation happens only when
+      you call <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20collect" class="source-link" target="_blank" rel="noopener"><code>.collect()</code></a>. A paradigm shift — but it
+      requires a JVM cluster.
+    </div>
+  </div>
+  <div class="timeline-item">
+    <div class="timeline-year">2021 — Polars arrives</div>
+    <div class="timeline-text">
+      Ritchie Vink releases Polars: a Rust-powered, lazy-first DataFrame
+      library that brings the benefits of Spark's query planning to a
+      single laptop. The expression API — <code>col("x") + col("y")</code>
+      — feels like magic.
+    </div>
+  </div>
+</div>
+
+<p>
+For a decade, Pandas was the king of this bridge. But Pandas has a
+fundamental architectural flaw that the industry is rapidly moving
+away from: <strong>Eager Execution</strong>.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 1.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Lesson 1.2</span>
+  The Memory Trap: Eager vs. Lazy Execution
+</h2>
+
+<p>
+To understand eager vs. lazy execution, let's look at how tabular data
+is usually represented in pure Python: a list of dictionaries.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Our data — a simple list of dicts</div>
+<pre><code><span class="va">raw_data</span> <span class="op">=</span> [
+    {<span class="st">"name"</span>: <span class="st">"Alice"</span>, <span class="st">"age"</span>: <span class="nu">30</span>, <span class="st">"region"</span>: <span class="st">"EU"</span>},
+    {<span class="st">"name"</span>: <span class="st">"Bob"</span>,   <span class="st">"age"</span>: <span class="nu">25</span>, <span class="st">"region"</span>: <span class="st">"US"</span>},
+]</code></pre>
+
+<p>
+A completely workable approach to building a DataFrame is to wrap this
+list in a class and write methods that loop through it:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> The eager approach — intuitive, but dangerous at scale</div>
+<pre data-executable data-label="Eager vs. lazy — try it"><code>raw_data = [
+    {"name": "Alice", "age": 30, "region": "EU"},
+    {"name": "Bob",   "age": 25, "region": "US"},
+    {"name": "Carol", "age": 35, "region": "EU"},
+    {"name": "Dave",  "age": 22, "region": "APAC"},
+]
+
+class EagerFrame:
+    def __init__(self, data):
+        self.data = data
+
+    def filter(self, condition):
+        # Executes immediately! Builds a brand new list in memory.
+        return EagerFrame([row for row in self.data if condition(row)])
+
+# Usage:
+df = EagerFrame(raw_data)
+df.filter(lambda row: row["age"] > 28)
+print("Eager result:", df.data)
+
+# Now compare with pyfloe's lazy approach:
+import pyfloe as pf
+lazy_df = pf.LazyFrame(raw_data)
+result = lazy_df.filter(pf.col("age") > 28).collect()
+print("Lazy result: ", result.to_pylist())</code></pre>
+
+<p>
+This list comprehension style is incredibly Pythonic. It works perfectly!
+You can pass any callable function, chain <code>.filter()</code> calls
+together, and it will give you the right answer.
+</p>
+
+<p>
+But there is a catch: this is <strong>Eager Execution</strong>.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The trap</div>
+  When you tell an eager engine to process a 10GB dataset, it immediately
+  tries to load all 10GB into RAM. Every time you call <code>.filter()</code>,
+  it iterates through millions of rows and creates a <strong>brand new
+  list</strong> in memory. If your laptop only has 8GB of RAM, your
+  program crashes.
+</div>
+
+<p>
+Modern tools like Polars and PySpark solve this with <strong>Lazy
+Execution</strong>. When you tell Polars to read a massive file and
+filter it, it doesn't run a for loop. It <em>waits</em> until you
+explicitly ask for the final result.
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="tag tag-eager">Eager</span> Pandas style</h4>
+    <p>
+      Each line runs immediately. Data is copied at every step. The file
+      is fully loaded before any filtering. Simple to debug line-by-line,
+      but memory explodes at scale.
+    </p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="tag tag-lazy">Lazy</span> Polars / Spark style</h4>
+    <p>
+      Operations build a plan describing <em>what</em> to do, not doing it.
+      Data flows only when you call <code>.collect()</code>. Memory stays
+      flat no matter how many operations you chain.
+    </p>
+  </div>
+</div>
+
+<p>
+But <em>how</em> does Python actually "wait"? The secret lies in a
+built-in feature you may have seen but rarely used:
+<strong>Generators</strong>.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 1.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Lesson 1.3</span>
+  Unlocking Laziness: Generators and the Volcano Model
+</h2>
+
+<p>
+When a normal Python function hits a <code>return</code> statement, it
+spits out the entire result and shuts down. If it's returning a list of
+10 million rows, it builds that entire list in memory first.
+</p>
+
+<p>
+But if you replace <code>return</code> with the <code>yield</code>
+keyword, the function becomes a <strong>Generator</strong>. When Python
+hits <code>yield</code>, it hands you one item, <em>pauses its exact
+state</em>, and waits. It only computes the next item when you
+explicitly ask for it.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> return vs. yield — the crucial difference</div>
+<pre><code><span class="cm"># Eager — builds entire list in memory</span>
+<span class="kw">def</span> <span class="fn">get_all_rows</span>():
+    <span class="kw">return</span> [row <span class="kw">for</span> row <span class="kw">in</span> million_row_dataset]  <span class="cm"># all at once</span>
+
+<span class="cm"># Lazy — yields one row at a time</span>
+<span class="kw">def</span> <span class="fn">get_rows_lazily</span>():
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> million_row_dataset:
+        <span class="kw">yield</span> <span class="va">row</span>                            <span class="cm"># one at a time, on demand</span></code></pre>
+
+<p>
+So generators let us produce data lazily. But a bare generator function
+is a one-shot, standalone thing. If we want to build a <em>pipeline</em>
+— read data, then filter it, then sort it — we need a way to
+<strong>connect</strong> these lazy steps together so each one can pull
+from the step before it.
+</p>
+
+<p>
+The trick is to wrap each step in a class. We'll call each class a
+<strong>"node"</strong> — as in, one link in a chain. Every node follows
+the same rule: it has an <code>.execute()</code> method that yields rows.
+Some nodes produce data on their own (read a file, hold a list). Other
+nodes receive a "child" node and transform whatever the child produces
+(filter it, add a column, sort it). Because every node speaks the same
+language — call <code>.execute()</code>, get rows — you can snap them
+together like building blocks.
+</p>
+
+<p>
+In database engineering, this pattern is called the <strong>Volcano
+Execution Model</strong>. Think of it like a chain of workers — each one
+only talks to the person next to them, passing items along. Let's build
+two nodes to see how it works:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> ScanNode — the data source</div>
+<pre><code><span class="kw">class</span> <span class="cl">ScanNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">data</span>):
+        <span class="va">self</span>.data <span class="op">=</span> <span class="va">data</span>
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>):
+        <span class="cm"># We don't return a list. We yield a generator!</span>
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.data:
+            <span class="kw">yield</span> <span class="va">row</span></code></pre>
+
+<div class="aside callout-teal">
+  <div class="aside-title">A subtle but crucial detail</div>
+  Look at that <code>for row in self.data</code> line. It doesn't call
+  <code>self.data[i]</code> or check <code>len(self.data)</code>. It just
+  iterates. That means <code>self.data</code> doesn't have to be a list —
+  it can be <em>anything</em> Python can iterate over. A generator that
+  reads lines from a CSV file. An API client that paginates through
+  results. A database cursor. This is how a lazy library reads a 10GB
+  file without loading it into memory: the "data" is a generator that
+  yields one row at a time from disk.
+</div>
+
+<p>
+So now we have a node that can produce rows lazily. But producing rows
+isn't useful on its own — we need to <em>do something</em> with them.
+Filter them, transform them, aggregate them.
+</p>
+
+<p>
+Here's the key idea: instead of writing a <code>filter()</code> method
+that loops through all the data and creates a new list, we create a
+<strong>second node</strong> that <em>wraps</em> the first one. A
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> takes a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> (or any other node)
+as its "child." When you ask the <code>FilterNode</code> to execute, it
+pulls rows from its child's <code>.execute()</code> and only yields the
+ones that pass the condition:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> FilterNode — pulls from its child, filters lazily</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>, <span class="va">condition</span>):
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>       <span class="cm"># could be a ScanNode, or another FilterNode!</span>
+        <span class="va">self</span>.condition <span class="op">=</span> <span class="va">condition</span>
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>):
+        <span class="cm"># Pull data upwards from the child node, lazily</span>
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+            <span class="kw">if</span> <span class="va">self</span>.condition(<span class="va">row</span>):
+                <span class="kw">yield</span> <span class="va">row</span></code></pre>
+
+<div class="aside callout-teal">
+  <div class="aside-title">The chain</div>
+  Read the <code>execute()</code> method carefully: <code>self.child.execute()</code>
+  calls the ScanNode's <code>execute()</code>, which yields rows one at a time.
+  The FilterNode tests each row and only yields the ones that pass. So we
+  get a chain: <code>ScanNode</code> → produces rows → <code>FilterNode</code>
+  → filters them. And because <code>FilterNode</code> also has an <code>.execute()</code>
+  method, you could wrap <em>it</em> in another <code>FilterNode</code>. Or a
+  <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" class="source-link" target="_blank" rel="noopener"><code>SortNode</code></a>. Or a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a>. Each node only knows about
+  its immediate child — they all speak the same language.
+</div>
+
+<div style="margin: 32px 0; text-align: center;">
+<svg width="100%" viewBox="0 0 520 370" style="max-width: 520px;" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M2 2L8 5L2 8" fill="none" stroke="#B4B2A9" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect class="node-box scan-fill" x="130" y="268" width="260" height="88"/>
+  <text class="label label-scan" x="260" y="293" text-anchor="middle">ScanNode</text>
+  <text class="row-text row-neutral" x="260" y="312" text-anchor="middle">{"name": "Alice", "age": 30, ...}</text>
+  <text class="row-text row-neutral" x="260" y="326" text-anchor="middle">{"name": "Bob",   "age": 25, ...}</text>
+  <text class="sub" x="260" y="347" text-anchor="middle">yields rows one at a time</text>
+
+  <line class="arr-line" x1="260" y1="268" x2="260" y2="222"/>
+
+  <rect class="node-box filter-fill" x="100" y="128" width="320" height="94"/>
+  <text class="label label-filter" x="260" y="153" text-anchor="middle">FilterNode</text>
+  <text class="sub" x="260" y="168" text-anchor="middle">condition: row["age"] > 28</text>
+  <text class="row-text row-pass" x="220" y="193">Alice, age 30</text>
+  <text class="verdict row-pass" x="370" y="193">pass</text>
+  <text class="row-text row-fail" x="220" y="209">Bob, age 25</text>
+  <text class="verdict row-fail" x="370" y="209">skip</text>
+
+  <line class="arr-line" x1="260" y1="128" x2="260" y2="82"/>
+
+  <rect class="node-box result-fill" x="150" y="30" width="220" height="52"/>
+  <text class="label label-result" x="260" y="52" text-anchor="middle">.collect()</text>
+  <text class="row-text" x="260" y="70" text-anchor="middle" fill="#534AB7">[{"name": "Alice", "age": 30}]</text>
+</svg>
+</div>
+
+<p>
+When <code>.collect()</code> pulls data through this chain:
+</p>
+
+<ol>
+  <li><code>collect()</code> calls <code>FilterNode.execute()</code>, which calls <code>ScanNode.execute()</code> — ScanNode yields Alice's row</li>
+  <li>FilterNode checks: is 30 &gt; 28? Yes &mdash; yields the row upward</li>
+  <li>FilterNode pulls Bob (25 &gt; 28? No &mdash; skipped), then ScanNode is exhausted &mdash; done</li>
+</ol>
+
+<p>
+Notice how each row is processed exactly once, and only one row is ever
+"in flight" at a time. That's the volcano model in action.
+</p>
+
+<h3>Wiring it up to a LazyFrame</h3>
+
+<p>
+Now we can rewrite our DataFrame to be completely lazy. When you call
+<code>.filter()</code>, it does <strong>zero data processing</strong>. It
+just wraps the current plan in a new <code>FilterNode</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> LazyFrame — nothing runs until .collect()</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">plan_node</span>):
+        <span class="va">self</span>._plan <span class="op">=</span> <span class="va">plan_node</span>
+
+    <span class="kw">def</span> <span class="fn">filter</span>(<span class="va">self</span>, <span class="va">condition</span>):
+        <span class="cm"># Instant! No data is processed here.</span>
+        <span class="va">new_plan</span> <span class="op">=</span> FilterNode(<span class="va">self</span>._plan, <span class="va">condition</span>)
+        <span class="kw">return</span> LazyFrame(<span class="va">new_plan</span>)
+
+    <span class="kw">def</span> <span class="fn">collect</span>(<span class="va">self</span>):
+        <span class="cm"># THIS is where execution finally happens.</span>
+        <span class="cm"># We pull data through the entire chain of generators.</span>
+        <span class="kw">return</span> <span class="bi">list</span>(<span class="va">self</span>._plan.execute())</code></pre>
+
+<p>
+Let's use it:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Building a plan, then executing it</div>
+<pre><code><span class="va">scan</span> <span class="op">=</span> ScanNode(<span class="va">raw_data</span>)
+<span class="va">df</span> <span class="op">=</span> LazyFrame(<span class="va">scan</span>)
+
+<span class="cm"># This just builds the plan: LazyFrame -> FilterNode -> ScanNode</span>
+<span class="va">query</span> <span class="op">=</span> <span class="va">df</span>.filter(<span class="kw">lambda</span> <span class="va">row</span>: <span class="va">row</span>[<span class="st">"age"</span>] <span class="op">&gt;</span> <span class="nu">28</span>)
+
+<span class="cm"># NOW the generators fire, pulling data through the chain:</span>
+<span class="va">result</span> <span class="op">=</span> <span class="va">query</span>.collect()
+<span class="bi">print</span>(<span class="va">result</span>)
+<span class="cm"># [{'name': 'Alice', 'age': 30, 'region': 'EU'}]</span></code></pre>
+
+<pre data-executable data-label="Volcano model — by hand, then pyfloe"><code># Part 1: Build it yourself — just generators and classes
+class ScanNode:
+    def __init__(self, data):
+        self.data = data
+    def execute(self):
+        for row in self.data:
+            yield row           # one row at a time!
+
+class FilterNode:
+    def __init__(self, child, condition):
+        self.child = child
+        self.condition = condition
+    def execute(self):
+        for row in self.child.execute():  # pull from child
+            if self.condition(row):
+                yield row                 # pass it up
+
+raw_data = [
+    {"name": "Alice", "age": 30, "region": "EU"},
+    {"name": "Bob",   "age": 25, "region": "US"},
+    {"name": "Carol", "age": 35, "region": "EU"},
+]
+
+scan = ScanNode(raw_data)
+filtered = FilterNode(scan, lambda row: row["age"] > 28)
+print("Hand-built volcano:", list(filtered.execute()))
+
+# Part 2: pyfloe does the exact same thing internally
+import pyfloe as pf
+lf = pf.LazyFrame(raw_data)
+result = lf.filter(pf.col("age") > 28).collect()
+print("pyfloe result:     ", result.to_pylist())</code></pre>
+
+<p>
+That's a working lazy DataFrame in about 30 lines of Python. Because
+data is processed one element at a time through generators, we can chain
+50 filters and transformations together, and our memory usage stays
+completely flat.
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Try it yourself</div>
+  Modify the code above. What happens if you add a second
+  <code>FilterNode</code> on top &mdash; say, filtering for
+  <code>region == "EU"</code>? Or change the condition to filter on a
+  different column? The best way to understand generators is to break
+  them and see what happens. Go ahead &mdash; the code is live.
+</div>
+
+<h3>The real power: stopping early</h3>
+
+<p>
+Here's where generators show their true strength. What if you don't need
+<em>all</em> the results — you just want the first match?
+</p>
+
+<p>
+With an eager approach, you'd have no choice: filter the entire dataset,
+build the full result list, then take element zero. A million rows in,
+one row out — and you processed all million.
+</p>
+
+<p>
+With generators, we can just... stop pulling:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> first() — stop the generators after one result</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="cm"># ... filter() and collect() from above ...</span>
+
+    <span class="kw">def</span> <span class="fn">first</span>(<span class="va">self</span>):
+        <span class="cm"># Pull just ONE row from the generator chain.</span>
+        <span class="cm"># The rest of the data is never touched.</span>
+        <span class="kw">return</span> <span class="bi">next</span>(<span class="va">self</span>._plan.execute())</code></pre>
+
+<p>
+That's it. Python's built-in <code>next()</code> pulls one value from a
+generator and then <em>stops asking</em>. The <code>FilterNode</code>
+pauses. The <code>ScanNode</code> pauses. If you have a billion rows
+but the first match is at row 5, you just processed 5 rows — not a
+billion.
+</p>
+
+<p>
+<strong>Pause and predict:</strong> in the example below, the data has
+three rows and we call <code>.first()</code> with a filter for
+<code>age &gt; 28</code>. How many rows will the <code>ScanNode</code>
+actually yield before everything stops? Think about it, then check
+your answer.
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Try it</div>
+<pre><code><span class="va">scan</span> <span class="op">=</span> ScanNode([
+    {<span class="st">"name"</span>: <span class="st">"Bob"</span>,   <span class="st">"age"</span>: <span class="nu">25</span>},
+    {<span class="st">"name"</span>: <span class="st">"Alice"</span>, <span class="st">"age"</span>: <span class="nu">30</span>},  <span class="cm"># match — stops here!</span>
+    {<span class="st">"name"</span>: <span class="st">"Carol"</span>, <span class="st">"age"</span>: <span class="nu">35</span>},  <span class="cm"># never even read</span>
+    <span class="cm"># ... imagine a million more rows ...</span>
+])
+<span class="va">df</span> <span class="op">=</span> LazyFrame(<span class="va">scan</span>)
+
+<span class="va">df</span>.filter(<span class="kw">lambda</span> <span class="va">row</span>: <span class="va">row</span>[<span class="st">"age"</span>] <span class="op">&gt;</span> <span class="nu">28</span>).first()
+<span class="cm"># {'name': 'Alice', 'age': 30}</span></code></pre>
+
+<div class="aside callout-teal">
+  <div class="aside-title">This is impossible with eager execution</div>
+  An <code>EagerFrame</code> would have to run the filter on
+  <em>every single row</em> before you could ask for the first result —
+  because the filter builds a complete list. Generators don't build
+  anything. They just yield the next item when you ask, and pause when
+  you don't. That pause is the entire trick.
+</div>
+
+<p>
+Polars and PySpark use this exact architecture. Their implementations are
+faster (batches instead of single rows, compiled code instead of Python),
+but the shape is identical: a chain of plan nodes, generators pulling
+data upward, nothing running until you ask.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- LESSON 1.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Lesson 1.4</span>
+  The Problem with Lambdas
+</h2>
+
+<p>
+We've solved the memory trap. Our engine is fully lazy. But there is a
+glaring problem with our <code>FilterNode</code>.
+</p>
+
+<p>
+Look at the filter we wrote:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> The lambda — a black box</div>
+<pre><code><span class="va">query</span> <span class="op">=</span> <span class="va">df</span>.filter(<span class="kw">lambda</span> <span class="va">row</span>: <span class="va">row</span>[<span class="st">"age"</span>] <span class="op">&gt;</span> <span class="nu">28</span>)</code></pre>
+
+<p>
+That <code>lambda</code> is a <strong>black box</strong>. Our engine can
+execute it — hand it a row, get True or False back — but it can never
+<em>look inside</em> to understand what it's doing.
+</p>
+
+<p>
+Why does that matter? Imagine you want to build a smart <strong>Query
+Optimizer</strong> — something that looks at your query plan and says:
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">What a smart optimizer would want to know</div>
+  <em>"This filter only uses the <code>age</code> column. The CSV file has
+  20 columns. Let's not bother carrying the other 19 through the rest
+  of the pipeline."</em>
+  <br><br>
+  <em>"There are two filters in a row. The first one only touches columns
+  from the left table, so we can push it down before the join."</em>
+  <br><br>
+  But with a lambda, the optimizer can't answer any of these questions.
+  Python cannot easily inspect which columns a lambda function uses.
+</div>
+
+<p>
+This is the difference between a toy and a real query engine. To build a
+truly expressive, optimizable API — the kind where you write
+<code>col("age") > 28</code> instead of a lambda — we need a way to
+represent computations as <strong>data</strong> that our engine can
+inspect.
+</p>
+
+<p>
+We need <code>col("age") > 28</code> to return not a boolean, but an
+<strong>expression</strong> — a small object that says "compare the
+<code>age</code> column to 28 using greater-than." On its own, that
+expression does nothing. It's just a description. But when a plan node
+like <code>FilterNode</code> receives it, it can inspect it — ask which
+columns it needs, rearrange it, and eventually evaluate it row by row.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Computer science loves trees</div>
+  Here's something that might trip you up: that expression is <em>also</em>
+  a tree. <code>col("age") > 28</code> has a <code>></code> at the
+  root, <code>col("age")</code> on the left, and <code>28</code> on the
+  right. That's a tree — an <strong>expression tree</strong>.
+  <br><br>
+  But it's a completely different tree from the chain of plan nodes we
+  just built. The <strong>plan</strong> describes <em>how data flows</em>
+  (scan → filter → collect). The <strong>expression</strong> describes
+  <em>what to compute</em> on each row. Expressions live <em>inside</em>
+  plan nodes — a <code>FilterNode</code> holds an expression that it
+  evaluates per row.
+  <br><br>
+  Two trees, both made of nodes, doing completely different jobs. You'll
+  build both in this course.
+</div>
+
+<p>
+To pull this off, we'll need to dive into one of the most powerful
+corners of Python: <strong>dunder methods and operator overloading</strong>.
+We need to hijack the <code>></code> operator so that instead of running
+a comparison, it <em>builds an expression object</em>.
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Coming in Module 2</div>
+  We'll build this expression system by hand. You'll learn how
+  <code>col("age") > 28</code> creates an expression (not a boolean),
+  how <code>col("a") + col("b")</code> creates another kind of expression,
+  and how the entire Polars-style <code>col()</code> API is really just
+  a collection of Python dunder methods building an expression tree that
+  the engine can walk and optimize.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2 id="exercises">
+  <span class="lesson-num">Exercises</span>
+  Check Your Understanding
+</h2>
+
+<p>
+Before moving to Module 2, make sure these concepts are solid:
+</p>
+
+<div class="interactive-box" id="quiz-container">
+  <h4>Quick check</h4>
+
+  <div id="quiz">
+    <div id="q1" class="quiz-question">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        1. In a lazy DataFrame library, when does computation actually happen?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">When you call .filter()</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">When you call .select()</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, true)">When you call .collect()</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">When you import the library</button>
+      </div>
+      <div id="feedback-1" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q2" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        2. In a lazy DataFrame library, what does <code>col("x") > 5</code> return?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">A list of booleans</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, true)">An expression object describing the comparison</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">True or False</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">A filtered DataFrame</button>
+      </div>
+      <div id="feedback-2" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q3" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        3. Why can't a query optimizer work with a <code>lambda</code> filter?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">Lambdas are too slow</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">Lambdas can't return booleans</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, true)">The engine can't inspect which columns a lambda uses</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">Lambdas don't work with generators</button>
+      </div>
+      <div id="feedback-3" class="output-box" style="display: none;"></div>
+    </div>
+
+    <div id="q4" class="quiz-question" style="margin-top: 24px;">
+      <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+        4. You have a pipeline: ScanNode &rarr; FilterNode &rarr; FilterNode &rarr; <code>.first()</code>.
+        The data has 1 million rows. The first filter passes ~10% of rows, and
+        the second filter's first match is at position 50 in the filtered stream.
+        Roughly how many rows does ScanNode yield?
+      </p>
+      <div class="btn-row">
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">1,000,000</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">100,000</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, true)">~500</button>
+        <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">50</button>
+      </div>
+      <div id="feedback-4" class="output-box" style="display: none;"></div>
+    </div>
+  </div>
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- HANDS-ON CHALLENGE -->
+<!-- ============================================================ -->
+
+<h2>
+  <span class="lesson-num">Challenge</span>
+  Build a MapNode
+</h2>
+
+<p>
+You've seen <code>FilterNode</code> — it pulls rows from its child and
+keeps the ones that pass a predicate. Now build a <code>MapNode</code>
+that <em>transforms</em> each row using a function. This is the
+generator-based equivalent of Python's built-in <code>map()</code>.
+</p>
+
+<p>Think about:</p>
+<ul>
+  <li>What does <code>execute()</code> yield? (Hint: the <em>transformed</em> row, not the original.)</li>
+  <li>Should it filter anything out, or pass every row through?</li>
+</ul>
+
+<div class="code-label"><span class="dot dot-python"></span> Starter code — fill in MapNode.execute()</div>
+<pre data-executable data-expanded data-label="Hands-on: build a MapNode"><code>class PlanNode:
+    def execute(self):
+        raise NotImplementedError
+
+class ScanNode(PlanNode):
+    def __init__(self, rows):
+        self.rows = rows
+    def execute(self):
+        yield from self.rows
+
+class MapNode(PlanNode):
+    def __init__(self, child, func):
+        self.child = child
+        self.func = func
+    def execute(self):
+        # TODO: yield each row transformed by self.func
+        pass
+
+# Test it: add a "senior" field based on age
+data = [
+    {"name": "Alice", "age": 35},
+    {"name": "Bob",   "age": 22},
+    {"name": "Carol", "age": 45},
+]
+
+def add_senior_flag(row):
+    return {**row, "senior": row["age"] >= 30}
+
+scan = ScanNode(data)
+mapped = MapNode(scan, add_senior_flag)
+
+for row in mapped.execute():
+    print(row)</code></pre>
+
+<button class="btn" onclick="document.getElementById('m1-solution').style.display = document.getElementById('m1-solution').style.display === 'none' ? 'block' : 'none'" style="margin-top: 16px;">Show Solution</button>
+
+<div id="m1-solution" style="display: none; margin-top: 16px;">
+<div class="code-label"><span class="dot dot-better"></span> MapNode — one line in execute()</div>
+<pre><code><span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>):
+    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+        <span class="kw">yield</span> <span class="va">self</span>.func(<span class="va">row</span>)</code></pre>
+<p>
+Every row flows through the function and out the other side. No rows are
+dropped — that's <code>FilterNode</code>'s job. Notice how composable this
+is: you could chain <code>ScanNode → MapNode → FilterNode</code> and get a
+lazy pipeline that transforms and filters with zero intermediate lists.
+</p>
+</div>
+
+<div class="source-references">
+  <h2>Source References</h2>
+  <div class="source-ref-group">
+    <h4>plan.py &mdash; Plan Nodes</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" target="_blank" rel="noopener">SortNode</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener">JoinNode</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>core.py &mdash; LazyFrame API</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20collect" target="_blank" rel="noopener">collect()</a></li>
+    </ul>
+  </div>
+</div>
+
+<hr class="separator">
+
+<script>
+const answers = {
+  1: {
+    correct: "Exactly. In lazy execution, .filter() and .select() just build plan nodes — descriptions of what to do. The generators only fire when you call .collect(), pulling data through the entire chain.",
+    wrong: "Not quite. In lazy execution, that call just creates a new plan node. No data moves. The generators only fire when you trigger materialization with .collect()."
+  },
+  2: {
+    correct: "Yes! The > operator doesn't compare any data. It builds an expression object that says 'compare column x to 5.' That expression is inert on its own — it only does something when a plan node like FilterNode evaluates it. We'll build this in Module 2.",
+    wrong: "Not quite. Because the library is lazy, col('x') > 5 doesn't touch any data. It returns an expression — a description of the comparison. On its own it does nothing, but a plan node like FilterNode can inspect it, optimize it, and evaluate it later."
+  },
+  3: {
+    correct: "Exactly. A lambda is a black box — the engine can call it, but can't look inside to see which columns it uses. That means it can't do smart things like skipping unused columns or reordering the plan. That's why we need an expression tree instead.",
+    wrong: "Not quite. Lambdas work fine for execution — the problem is optimization. The engine can't inspect a lambda to see which columns it touches, so it can't make smart decisions like pruning unused columns or reordering the plan."
+  },
+  4: {
+    correct: "Exactly. Because generators are lazy, ScanNode only yields rows as they're pulled. The first filter passes ~10%, so to get 50 filtered rows through the second filter, the first filter needs to see about 500 rows. ScanNode yields ~500 rows and then .first() stops pulling. The other 999,500 rows are never touched — that's the power of lazy evaluation.",
+    wrong: "Not quite. Think about how generators chain together. .first() only needs one result from the second filter. The second filter needs 50 rows from the first filter to find its match. The first filter passes ~10%, so it needs ~500 rows from ScanNode to produce 50. The rest of the million rows are never even read."
+  }
+};
+
+function checkAnswer(q, btn, correct) {
+  const feedback = document.getElementById('feedback-' + q);
+  const btns = btn.parentElement.querySelectorAll('.quiz-btn');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+  btn.style.opacity = '1';
+
+  if (correct) {
+    btn.style.borderColor = '#0F6E56';
+    btn.style.background = '#E1F5EE';
+    btn.style.color = '#0F6E56';
+    feedback.className = 'output-box';
+    feedback.textContent = answers[q].correct;
+  } else {
+    btn.style.borderColor = '#A32D2D';
+    btn.style.background = '#FCEBEB';
+    btn.style.color = '#A32D2D';
+    feedback.className = 'output-box error';
+    feedback.textContent = answers[q].wrong;
+  }
+  feedback.style.display = 'block';
+}
+</script>

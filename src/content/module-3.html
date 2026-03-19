@@ -1,0 +1,1437 @@
+<h1>The Engine Room —<br>Plan Nodes &amp; <em>Batched Execution</em></h1>
+
+<p class="subtitle">
+In Module 1 we built a lazy pipeline with generators. In Module 2 we
+built an expression AST that captures computations as data. Now it's
+time to wire them together — and in doing so, build a real execution
+engine.
+</p>
+
+<p>
+Right now, our two creations live in separate worlds. The plan tree
+from Module 1 uses lambdas to filter rows. The expression AST from
+Module 2 can describe <code>col("age") > 28</code> as a tree — but
+has nowhere to run. This module is the wedding: expressions will plug
+into plan nodes, and together they'll form something that actually
+<em>looks</em> like a real query engine.
+</p>
+
+<p>
+Along the way, we'll confront a performance problem that every
+pure-Python data engine faces, and solve it the same way pyfloe does:
+by processing data in <strong>batches</strong> instead of one row at
+a time. And we'll wrap everything in a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> class
+that gives end users the fluent API they expect.
+</p>
+
+<nav class="toc">
+  <div class="toc-title">In this module</div>
+  <a class="toc-item" href="#lesson-1"><span class="toc-num">3.1</span> From Lambdas to Expressions in Plan Nodes</a>
+  <a class="toc-item" href="#lesson-2"><span class="toc-num">3.2</span> ProjectNode — Select and Compute</a>
+  <a class="toc-item" href="#lesson-3"><span class="toc-num">3.3</span> Batched Execution — Why Not One Row at a Time?</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">3.4</span> The LazyFrame Wrapper</a>
+  <a class="toc-item" href="#lesson-5"><span class="toc-num">3.5</span> Schema Propagation Without Data</a>
+  <a class="toc-item" href="#exercises"><span class="toc-num">&bull;</span> Exercises</a>
+</nav>
+
+
+<!-- ============================================================ -->
+<!-- LESSON 3.1 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-1">
+  <span class="lesson-num">Lesson 3.1</span>
+  From Lambdas to Expressions in Plan Nodes
+</h2>
+
+<p>
+Let's recall the <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> we built in Module 1. It took
+a <code>condition</code> parameter — a lambda — and used it to decide
+which rows to yield:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Module 1's FilterNode — lambda-based</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">ScanNode</span>, <span class="va">condition</span>: <span class="cl">Callable</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>.condition <span class="op">=</span> <span class="va">condition</span>  <span class="cm"># a lambda — opaque!</span>
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+            <span class="kw">if</span> <span class="va">self</span>.condition(<span class="va">row</span>):
+                <span class="kw">yield</span> <span class="va">row</span></code></pre>
+
+<p>
+This works. But as we established at the end of Module 1 and proved
+throughout Module 2, the lambda is a <strong>black box</strong>. We
+can't ask it "which columns do you need?" or "can I push you below
+this join?" Now we have something better — an <code>Expr</code>
+object that can answer both questions. Let's plug it in.
+</p>
+
+<h3>Step 1: Replace the lambda with an Expr</h3>
+
+<p>
+The simplest upgrade is straightforward: instead of accepting a lambda,
+our <code>FilterNode</code> accepts an <code>Expr</code> and calls its
+<code>eval()</code> method on each row.
+</p>
+
+<p>
+But <code>eval()</code> needs a <code>col_map</code> — a dictionary
+mapping column names to their positions in the tuple. Remember, our rows
+are stored as tuples like <code>("Alice", 30, "NYC")</code> for
+efficiency, and the expression <code>col("age")</code> needs to know
+that <code>"age"</code> lives at index 1. The <code>col_map</code> is
+that lookup table:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> The col_map bridges names to positions</div>
+<pre><code><span class="cm"># If columns are ["name", "age", "city"]</span>
+<span class="cm"># then a row like ("Alice", 30, "NYC") needs:</span>
+<span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>] <span class="op">=</span> {<span class="st">"name"</span>: <span class="nu">0</span>, <span class="st">"age"</span>: <span class="nu">1</span>, <span class="st">"city"</span>: <span class="nu">2</span>}
+
+<span class="cm"># Now col("age").eval(row, col_map) → row[1] → 30</span></code></pre>
+
+<p>
+With that in mind, here's our first Expr-powered <code>FilterNode</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> FilterNode v2 — expression-based</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">PlanNode</span>, <span class="va">predicate</span>: <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>.predicate <span class="op">=</span> <span class="va">predicate</span>  <span class="cm"># an Expr — inspectable!</span>
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="cm"># Build the name→index mapping from the child's columns</span>
+        <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>] <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">self</span>.child.columns)}
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+            <span class="kw">if</span> <span class="va">self</span>.predicate.eval(<span class="va">row</span>, <span class="va">col_map</span>):
+                <span class="kw">yield</span> <span class="va">row</span></code></pre>
+
+<details class="recall">
+  <summary>Recall from Module 2 — how Expr.eval() works</summary>
+  <div class="recall-body">
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>: <span class="va">tuple</span>, <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>]) <span class="op">-&gt;</span> <span class="cl">Any</span>:
+        <span class="kw">return</span> <span class="va">row</span>[<span class="va">col_map</span>[<span class="va">self</span>.name]]  <span class="cm"># look up index, then value</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>: <span class="va">tuple</span>, <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>]) <span class="op">-&gt;</span> <span class="cl">Any</span>:
+        <span class="kw">return</span> <span class="va">self</span>.value              <span class="cm"># always returns the constant</span>
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">eval</span>(<span class="va">self</span>, <span class="va">row</span>: <span class="va">tuple</span>, <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>]) <span class="op">-&gt;</span> <span class="cl">Any</span>:
+        <span class="va">lv</span> <span class="op">=</span> <span class="va">self</span>.left.eval(<span class="va">row</span>, <span class="va">col_map</span>)   <span class="cm"># recurse left</span>
+        <span class="va">rv</span> <span class="op">=</span> <span class="va">self</span>.right.eval(<span class="va">row</span>, <span class="va">col_map</span>)  <span class="cm"># recurse right</span>
+        <span class="kw">return</span> <span class="va">self</span>.op(<span class="va">lv</span>, <span class="va">rv</span>)              <span class="cm"># apply operator</span></code></pre>
+    <p class="recall-note">
+      So <code>predicate.eval(row, col_map)</code> in our new FilterNode
+      walks this tree recursively — BinaryExpr calls Col and Lit, which
+      return values, then applies the operator.
+    </p>
+  </div>
+</details>
+
+<p>
+Same structure. Same generator pattern. But the <code>predicate</code>
+is now an <code>Expr</code> object — and that means our engine can call
+<code>predicate.required_columns()</code> to learn it only needs
+<code>{"age"}</code>, or pass the whole expression to an optimizer that
+rewrites the plan tree. The black box is gone.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The two trees meet</div>
+  This is the moment the <strong>expression tree</strong> from Module 2
+  plugs into the <strong>plan tree</strong> from Module 1. The
+  <code>FilterNode</code> is a plan node — it describes data flow. The
+  <code>predicate</code> is an expression — it describes computation.
+  From here on, expressions always live <em>inside</em> plan nodes.
+</div>
+
+<pre data-executable data-label="Plan nodes — pyfloe internals"><code>import pyfloe as pf
+from pyfloe.plan import ScanNode, FilterNode, ProjectNode
+
+# These are pyfloe's REAL plan nodes — the same ones
+# that run when you call .filter() or .select().
+
+data = [("Alice", 30, 80000), ("Bob", 25, 55000), ("Carol", 35, 95000)]
+
+# Step 1: ScanNode wraps raw data + column names
+scan = ScanNode(data, ["name", "age", "salary"])
+
+# Step 2: FilterNode takes a child node + an expression
+filtered = FilterNode(scan, pf.col("age") > 28)
+
+# Step 3: ProjectNode selects columns
+projected = ProjectNode(filtered, ["name", "salary"])
+
+# See the plan tree — same output as LazyFrame.explain()
+print(projected.explain())
+print()
+
+# Execute it — data flows bottom-up through the nodes
+for batch in projected.execute_batched():
+    for row in batch:
+        print(row)</code></pre>
+
+<h3>Step 2: The col_map problem</h3>
+
+<p>
+There's a subtle performance issue with our v2 <code>FilterNode</code>.
+Look at the <code>execute()</code> method: for <em>every row</em>, we
+call <code>self.predicate.eval(row, col_map)</code>. That <code>eval()</code>
+call walks the expression tree recursively. For a simple filter like
+<code>col("age") > 28</code>, that's three method calls per row
+(BinaryExpr.eval → Col.eval + Lit.eval). For a million rows, that's
+three million Python function calls — just for the expression.
+</p>
+
+<p>
+pyfloe has a clever solution: <code>Expr.compile()</code>. Instead of
+walking the tree at runtime, <code>compile()</code> walks the tree
+<em>once</em> and returns a single closure that does the same work.
+The col_map is baked into the closure at compile time — no dictionary
+lookups at runtime:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> How compile() works for Col</div>
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">compile</span>(<span class="va">self</span>, <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>]) <span class="op">-&gt;</span> <span class="cl">Callable</span>[[<span class="va">tuple</span>], <span class="cl">Any</span>]:
+        <span class="va">idx</span> <span class="op">=</span> <span class="va">col_map</span>[<span class="va">self</span>.name]   <span class="cm"># look up ONCE</span>
+        <span class="kw">return</span> <span class="kw">lambda</span> <span class="va">row</span>: <span class="va">row</span>[<span class="va">idx</span>]  <span class="cm"># fast index at runtime</span></code></pre>
+
+<p>
+And for <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a>:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> How compile() works for BinaryExpr</div>
+<pre><code><span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">compile</span>(<span class="va">self</span>, <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>]) <span class="op">-&gt;</span> <span class="cl">Callable</span>[[<span class="va">tuple</span>], <span class="cl">Any</span>]:
+        <span class="va">left_fn</span> <span class="op">=</span> <span class="va">self</span>.left.compile(<span class="va">col_map</span>)    <span class="cm"># compile children</span>
+        <span class="va">right_fn</span> <span class="op">=</span> <span class="va">self</span>.right.compile(<span class="va">col_map</span>)  <span class="cm"># once, up front</span>
+        <span class="va">op</span> <span class="op">=</span> <span class="va">self</span>.op
+        <span class="kw">def</span> <span class="fn">_eval</span>(<span class="va">row</span>: <span class="va">tuple</span>) <span class="op">-&gt;</span> <span class="cl">Any</span>:
+            <span class="va">lv</span> <span class="op">=</span> <span class="va">left_fn</span>(<span class="va">row</span>)
+            <span class="va">rv</span> <span class="op">=</span> <span class="va">right_fn</span>(<span class="va">row</span>)
+            <span class="kw">if</span> <span class="va">lv</span> <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> <span class="va">rv</span> <span class="kw">is</span> <span class="kw">None</span>:
+                <span class="kw">return</span> <span class="kw">None</span>
+            <span class="kw">return</span> <span class="va">op</span>(<span class="va">lv</span>, <span class="va">rv</span>)
+        <span class="kw">return</span> <span class="va">_eval</span></code></pre>
+
+<p>
+The idea is elegant: <code>compile()</code> recursively compiles each
+child into a closure, then wraps them all into one top-level closure.
+The result is a single callable that takes a row tuple and returns the
+answer — no tree walking, no dictionary lookups, no method dispatch.
+Just nested function calls with pre-resolved indices.
+</p>
+
+<p>
+Now let's see pyfloe's real <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a>, which uses
+<code>compile()</code> plus one more trick:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's FilterNode (plan.py)</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>(<span class="cl">PlanNode</span>):
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"child"</span>, <span class="st">"predicate"</span>)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">PlanNode</span>, <span class="va">predicate</span>: <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>.predicate <span class="op">=</span> <span class="va">predicate</span>
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="va">col_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(
+            <span class="va">self</span>.child.schema().column_names)}
+        <span class="va">pred_fn</span> <span class="op">=</span> <span class="va">self</span>.predicate.compile(<span class="va">col_map</span>)
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+            <span class="va">filtered</span> <span class="op">=</span> <span class="fn">list</span>(<span class="fn">compress</span>(<span class="va">chunk</span>, <span class="fn">map</span>(<span class="va">pred_fn</span>, <span class="va">chunk</span>)))
+            <span class="kw">if</span> <span class="va">filtered</span>:
+                <span class="kw">yield</span> <span class="va">filtered</span></code></pre>
+
+<p>
+Three things to notice here beyond our simplified version:
+</p>
+
+<p>
+<strong><code>__slots__</code></strong> — Same pattern as Module 2's
+expression nodes: lightweight objects, no per-instance
+<code>__dict__</code>. You'll see <code>__slots__</code> on every node
+class from here on — it's the standard pattern.
+</p>
+
+<p>
+<strong><code>compress()</code></strong> — Instead of a for-loop with
+an if-statement, pyfloe uses <code>itertools.compress()</code>. This
+stdlib function takes a data sequence and a selector sequence, and
+yields only the data elements where the selector is truthy. Combined
+with <code>map(pred_fn, chunk)</code>, it's a concise way to apply the
+predicate and filter in one shot — and it runs partly in C, which is
+faster than a Python loop.
+</p>
+
+<p>
+<strong><code>execute_batched()</code></strong> — The method isn't
+<code>execute()</code>; it's <code>execute_batched()</code>. We'll
+get to this in Lesson 3.3, but the short version is: pyfloe processes
+data in chunks of 1,024 rows instead of one at a time. For now, just
+notice that the predicate is compiled <em>once</em>, before the loop —
+not per-row.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  When you write <code>df.filter(col("age") > 28)</code> in Polars, the
+  same thing happens: the expression becomes an AST node, which Polars
+  compiles into vectorized Rust code operating on Arrow arrays. The
+  compilation is more sophisticated, but the architecture is the same:
+  build a tree, compile it, run the compiled version against the data.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 3.2 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-2">
+  <span class="lesson-num">Lesson 3.2</span>
+  ProjectNode — Select and Compute
+</h2>
+
+<p>
+Filtering rows is only half the story. A real query engine also needs
+to transform <em>columns</em>: selecting a subset, reordering them, or
+computing new ones. In SQL, this is the <code>SELECT</code> clause.
+In Polars, it's <code>.select()</code>. In our engine, it's the
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a>.
+</p>
+
+<p>
+A <code>ProjectNode</code> sits in the plan tree just like a
+<code>FilterNode</code>, but instead of dropping rows, it reshapes them.
+It has two modes, and both are important.
+</p>
+
+<h3>Mode 1: Column selection</h3>
+
+<p>
+The simplest case: the user wants to keep only some columns. If your
+data has <code>["name", "age", "city", "salary"]</code> and the user
+calls <code>.select("name", "salary")</code>, the <code>ProjectNode</code>
+needs to extract just those two columns from every row. Python's
+<code>operator.itemgetter</code> is built for exactly this:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> itemgetter — fast multi-index extraction</div>
+<pre><code><span class="kw">from</span> <span class="cl">operator</span> <span class="kw">import</span> <span class="fn">itemgetter</span>
+
+<span class="va">getter</span> <span class="op">=</span> <span class="fn">itemgetter</span>(<span class="nu">0</span>, <span class="nu">3</span>)       <span class="cm"># extract indices 0 and 3</span>
+<span class="va">row</span> <span class="op">=</span> (<span class="st">"Alice"</span>, <span class="nu">30</span>, <span class="st">"NYC"</span>, <span class="nu">85000</span>)
+<span class="va">getter</span>(<span class="va">row</span>)                       <span class="cm"># → ("Alice", 85000)</span></code></pre>
+
+<p>
+<code>itemgetter</code> is implemented in C and returns a tuple directly —
+no intermediate generator, no Python loop. It's 2–5× faster than the
+generator expression approach for multi-column extraction.
+</p>
+
+<h3>Mode 2: Expression evaluation</h3>
+
+<p>
+The second mode is more powerful: instead of selecting existing columns,
+we compute <em>new</em> columns from expressions. When the user writes:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Selecting with expressions</div>
+<pre><code><span class="va">df</span>.select(
+    col(<span class="st">"name"</span>),
+    (col(<span class="st">"price"</span>) <span class="op">*</span> col(<span class="st">"qty"</span>)).alias(<span class="st">"total"</span>)
+)</code></pre>
+
+<p>
+the <code>ProjectNode</code> needs to evaluate each expression per row
+and assemble the results into a new tuple. This is where
+<code>compile()</code> pays off again — we compile each expression once,
+then run the compiled closures per row:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> ProjectNode with expression evaluation</div>
+<pre><code><span class="kw">class</span> <span class="cl">ProjectNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">PlanNode</span>,
+                 <span class="va">columns</span>: <span class="va">list</span>[<span class="va">str</span>] <span class="op">|</span> <span class="kw">None</span> <span class="op">=</span> <span class="kw">None</span>,
+                 <span class="va">exprs</span>: <span class="va">list</span>[<span class="cl">Expr</span>] <span class="op">|</span> <span class="kw">None</span> <span class="op">=</span> <span class="kw">None</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>._columns <span class="op">=</span> <span class="va">columns</span>  <span class="cm"># for column selection</span>
+        <span class="va">self</span>._exprs <span class="op">=</span> <span class="va">exprs</span>      <span class="cm"># for expression evaluation</span>
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>] <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">self</span>.child.columns)}
+        <span class="kw">if</span> <span class="va">self</span>._columns:
+            <span class="va">getter</span> <span class="op">=</span> <span class="fn">itemgetter</span>(<span class="op">*</span>[<span class="va">col_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>._columns])
+            <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+                <span class="kw">yield</span> <span class="va">getter</span>(<span class="va">row</span>)
+        <span class="kw">elif</span> <span class="va">self</span>._exprs:
+            <span class="va">compiled</span> <span class="op">=</span> [<span class="va">e</span>.compile(<span class="va">col_map</span>) <span class="kw">for</span> <span class="va">e</span> <span class="kw">in</span> <span class="va">self</span>._exprs]
+            <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+                <span class="kw">yield</span> <span class="fn">tuple</span>(<span class="va">fn</span>(<span class="va">row</span>) <span class="kw">for</span> <span class="va">fn</span> <span class="kw">in</span> <span class="va">compiled</span>)</code></pre>
+
+<p>
+Notice the two branches: <code>_columns</code> (names only, use
+<code>itemgetter</code>) vs. <code>_exprs</code> (full expressions,
+use compiled closures). This dual-mode design lets the same node handle
+both <code>.select("name", "age")</code> and
+<code>.select(col("price") * col("qty"))</code>.
+</p>
+
+<p>
+Now let's see pyfloe's real implementation, which adds batched
+processing and a special case for single-column selection:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's ProjectNode (plan.py) — execute_batched</div>
+<pre><code><span class="kw">class</span> <span class="cl">ProjectNode</span>(<span class="cl">PlanNode</span>):
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"child"</span>, <span class="st">"_columns"</span>, <span class="st">"_exprs"</span>)
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="va">col_map</span> <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(
+            <span class="va">self</span>.child.schema().column_names)}
+
+        <span class="kw">if</span> <span class="va">self</span>._columns:
+            <span class="va">indices</span> <span class="op">=</span> [<span class="va">col_map</span>[<span class="va">c</span>] <span class="kw">for</span> <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>._columns]
+            <span class="va">n</span> <span class="op">=</span> <span class="fn">len</span>(<span class="va">indices</span>)
+            <span class="kw">if</span> <span class="va">n</span> <span class="op">==</span> <span class="nu">1</span>:
+                <span class="va">idx</span> <span class="op">=</span> <span class="va">indices</span>[<span class="nu">0</span>]
+                <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+                    <span class="kw">yield</span> [(<span class="va">row</span>[<span class="va">idx</span>],) <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">chunk</span>]
+            <span class="kw">else</span>:
+                <span class="va">getter</span> <span class="op">=</span> <span class="fn">itemgetter</span>(<span class="op">*</span><span class="va">indices</span>)
+                <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+                    <span class="kw">yield</span> <span class="fn">list</span>(<span class="fn">map</span>(<span class="va">getter</span>, <span class="va">chunk</span>))
+        <span class="kw">elif</span> <span class="va">self</span>._exprs:
+            <span class="va">compiled</span> <span class="op">=</span> [<span class="va">e</span>.compile(<span class="va">col_map</span>) <span class="kw">for</span> <span class="va">e</span> <span class="kw">in</span> <span class="va">self</span>._exprs]
+            <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+                <span class="kw">yield</span> [<span class="fn">tuple</span>(<span class="va">fn</span>(<span class="va">row</span>) <span class="kw">for</span> <span class="va">fn</span> <span class="kw">in</span> <span class="va">compiled</span>)
+                       <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">chunk</span>]</code></pre>
+
+<p>
+The single-column special case (<code>n == 1</code>) avoids
+<code>itemgetter</code> entirely because <code>itemgetter</code> with
+one argument returns the value directly, not a tuple — which would
+break the rest of the engine that expects rows to always be tuples.
+The multi-column path uses <code>list(map(getter, chunk))</code>
+instead of a list comprehension — this keeps the tight C-level
+<code>map()</code> loop for maximum speed.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">The pattern repeats</div>
+  Notice how both <code>FilterNode</code> and <code>ProjectNode</code>
+  follow the same recipe: build the <code>col_map</code> from the child's
+  schema, compile or resolve the expressions once, then loop over chunks.
+  This pattern will repeat for every plan node we build. The compile step
+  happens outside the loop; the hot path inside the loop is as lean as
+  possible.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 3.3 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-3">
+  <span class="lesson-num">Lesson 3.3</span>
+  Batched Execution — Why Not One Row at a Time?
+</h2>
+
+<p>
+In Module 1, we celebrated the elegance of generators: each plan node
+yields one row at a time, and data flows through the chain with minimal
+memory. But there's a cost we swept under the rug. Let's uncover it.
+</p>
+
+<details class="recall">
+  <summary>Recall from Module 1 — our generator-based plan nodes</summary>
+  <div class="recall-body">
+<pre><code><span class="kw">class</span> <span class="cl">ScanNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">data</span>: <span class="va">list</span>[<span class="va">tuple</span>]) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.data <span class="op">=</span> <span class="va">data</span>
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.data:
+            <span class="kw">yield</span> <span class="va">row</span>       <span class="cm"># one row per next() call</span>
+
+<span class="kw">class</span> <span class="cl">FilterNode</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">ScanNode</span>, <span class="va">condition</span>: <span class="cl">Callable</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>.condition <span class="op">=</span> <span class="va">condition</span>
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">self</span>.child.execute():
+            <span class="kw">if</span> <span class="va">self</span>.condition(<span class="va">row</span>):
+                <span class="kw">yield</span> <span class="va">row</span>  <span class="cm"># one row per next() call</span></code></pre>
+    <p class="recall-note">
+      Each <code>yield</code> suspends the generator and returns one row.
+      The parent calls <code>next()</code> to resume it. Elegant — but
+      every <code>yield</code>/<code>next()</code> pair is a Python
+      function call with overhead.
+    </p>
+  </div>
+</details>
+
+<h3>The problem: function call overhead</h3>
+
+<p>
+Every time a Python generator yields a value, there's overhead: the
+frame object is suspended, the caller resumes, the result is passed
+across. Every time a function is called, there's overhead: argument
+packing, the call stack, frame creation. In C or Rust, function call
+overhead is negligible — a few nanoseconds. In Python, it's
+<em>significant</em>.
+</p>
+
+<p>
+Consider a simple pipeline: <code>ScanNode → FilterNode → ProjectNode</code>.
+For each row, the execution looks like:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Row-at-a-time execution — hidden cost</div>
+<pre><code><span class="cm"># For EVERY ROW in the dataset:</span>
+<span class="cm">#   1. ProjectNode calls next() on FilterNode     ← overhead</span>
+<span class="cm">#   2. FilterNode calls next() on ScanNode         ← overhead</span>
+<span class="cm">#   3. ScanNode yields one row                     ← overhead</span>
+<span class="cm">#   4. FilterNode calls pred_fn(row)                ← overhead</span>
+<span class="cm">#   5. FilterNode yields (maybe)                    ← overhead</span>
+<span class="cm">#   6. ProjectNode calls getter(row)                ← overhead</span>
+<span class="cm">#   7. ProjectNode yields                           ← overhead</span>
+<span class="cm">#</span>
+<span class="cm"># That's ~7 Python function calls per row.</span>
+<span class="cm"># For 1 million rows: 7 million function calls.</span>
+<span class="cm"># At ~100ns each: ~0.7 seconds of PURE OVERHEAD.</span></code></pre>
+
+<p>
+The actual filtering and projection — the "useful" work — might take
+only 0.1 seconds. But the overhead of shuttling rows one at a time
+through the Python generator chain <em>dominates</em>.
+</p>
+
+<div class="aside callout-red">
+  <div class="aside-title">The overhead trap</div>
+  This isn't a hypothetical problem. It's the reason every serious
+  pure-Python data processing library uses some form of batching. If
+  you're moving data through multiple stages in Python, the cost of
+  moving it <em>one piece at a time</em> eventually overwhelms the cost
+  of processing it.
+</div>
+
+<p>
+<strong>Pause and predict:</strong> if each row incurs ~7 Python function
+calls for overhead, and you have 1 million rows, that's 7 million overhead
+calls. What if you could process 1,024 rows per generator transition
+instead of one? How many overhead calls would that be?
+</p>
+
+<h3>The solution: process in batches</h3>
+
+<p>
+The fix is conceptually simple: instead of yielding one row per
+<code>next()</code> call, yield a <em>list</em> of rows. If we yield
+1,024 rows at a time, we cut the number of generator transitions by a
+factor of 1,024. The overhead per row drops from ~7 function calls to
+~7/1024 ≈ 0.007 function calls — essentially free.
+</p>
+
+<p>
+Here's the batched version of our <code>FilterNode</code>:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Batched FilterNode — 1024 rows at a time</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>:
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="va">col_map</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="va">int</span>] <span class="op">=</span> {<span class="va">n</span>: <span class="va">i</span> <span class="kw">for</span> <span class="va">i</span>, <span class="va">n</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">self</span>.child.columns)}
+        <span class="va">pred_fn</span> <span class="op">=</span> <span class="va">self</span>.predicate.compile(<span class="va">col_map</span>)
+        <span class="cm"># Pull CHUNKS from child, not individual rows</span>
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+            <span class="va">filtered</span> <span class="op">=</span> [<span class="va">row</span> <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">chunk</span> <span class="kw">if</span> <span class="va">pred_fn</span>(<span class="va">row</span>)]
+            <span class="kw">if</span> <span class="va">filtered</span>:
+                <span class="kw">yield</span> <span class="va">filtered</span></code></pre>
+
+<p>
+The inner loop is now a list comprehension — one of the fastest loop
+constructs in Python. And we only yield across the generator boundary
+once per chunk, not once per row.
+</p>
+
+<h3>The <code>_batched()</code> helper</h3>
+
+<p>
+But where do the chunks come from in the first place? The leaf node
+(usually a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a>) has to slice its data into batches.
+pyfloe uses a small helper function for this:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's _batched() helper (plan.py)</div>
+<pre><code><span class="kw">from</span> <span class="cl">itertools</span> <span class="kw">import</span> <span class="fn">islice</span>
+
+<span class="va">_BATCH_SIZE</span>: <span class="va">int</span> <span class="op">=</span> <span class="nu">1024</span>
+
+<span class="kw">def</span> <span class="fn">_batched</span>(<span class="va">iterable</span>: <span class="cl">Iterable</span>, <span class="va">n</span>: <span class="va">int</span> <span class="op">=</span> <span class="va">_BATCH_SIZE</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>]:
+    <span class="va">it</span> <span class="op">=</span> <span class="fn">iter</span>(<span class="va">iterable</span>)
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="va">chunk</span> <span class="op">=</span> <span class="fn">list</span>(<span class="fn">islice</span>(<span class="va">it</span>, <span class="va">n</span>))
+        <span class="kw">if not</span> <span class="va">chunk</span>:
+            <span class="kw">break</span>
+        <span class="kw">yield</span> <span class="va">chunk</span></code></pre>
+
+<p>
+<code>islice(it, n)</code> pulls up to <code>n</code> items from the
+iterator without loading everything into memory. The <code>list()</code>
+call materializes just that chunk. The result: a generator that yields
+lists of up to 1,024 rows each.
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Why 1,024?</div>
+  The batch size of 1,024 is a pragmatic choice. Too small (say, 10)
+  and you barely reduce overhead. Too large (say, 1,000,000) and you
+  lose the streaming property — you'd hold a huge chunk in memory
+  between nodes.   1,024 is a sweet spot: large enough to amortize
+  Python's per-call overhead, small enough to keep memory usage modest.
+</div>
+
+<h3>Bridging batched and unbatched: <code>PlanNode</code></h3>
+
+<p>
+pyfloe's base class, <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" class="source-link" target="_blank" rel="noopener"><code>PlanNode</code></a>, defines both interfaces
+and bridges them automatically:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's PlanNode base class (plan.py)</div>
+<pre><code><span class="kw">from</span> <span class="cl">itertools</span> <span class="kw">import</span> <span class="fn">chain</span>
+
+<span class="kw">class</span> <span class="cl">PlanNode</span>:
+    <span class="va">__slots__</span> <span class="op">=</span> ()
+
+    <span class="kw">def</span> <span class="fn">execute</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">tuple</span>]:
+        <span class="st">"""Yield rows one at a time (flattens batched output)."""</span>
+        <span class="kw">return</span> <span class="va">chain</span>.from_iterable(<span class="va">self</span>.execute_batched())
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="st">"""Yield lists of rows. Subclasses override this."""</span>
+        <span class="kw">raise</span> <span class="cl">NotImplementedError</span></code></pre>
+
+<p>
+The key insight: <strong>subclasses implement <code>execute_batched()</code>,
+and <code>execute()</code> comes for free</strong>.
+<code>chain.from_iterable</code> takes an iterable of lists and flattens
+them into a single stream of individual items — it's the bridge between
+the batched world (where the engine operates internally) and the
+unbatched world (where the user consumes results one at a time).
+</p>
+
+<p>
+Let's see how <code>ScanNode</code> produces its batches:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's ScanNode (plan.py)</div>
+<pre><code><span class="kw">class</span> <span class="cl">ScanNode</span>(<span class="cl">PlanNode</span>):
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"_data"</span>, <span class="st">"_columns"</span>, <span class="st">"_schema"</span>)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">data</span>: <span class="va">list</span>[<span class="va">tuple</span>],
+                 <span class="va">columns</span>: <span class="va">list</span>[<span class="va">str</span>],
+                 <span class="va">lazy_schema</span>: <span class="cl">LazySchema</span> <span class="op">|</span> <span class="kw">None</span> <span class="op">=</span> <span class="kw">None</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>._data <span class="op">=</span> <span class="va">data</span>
+        <span class="va">self</span>._columns <span class="op">=</span> <span class="fn">list</span>(<span class="va">columns</span>)
+        <span class="va">self</span>._schema <span class="op">=</span> <span class="va">lazy_schema</span>
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="va">data</span> <span class="op">=</span> <span class="va">self</span>._data
+        <span class="kw">for</span> <span class="va">i</span> <span class="kw">in</span> <span class="fn">range</span>(<span class="nu">0</span>, <span class="fn">len</span>(<span class="va">data</span>), <span class="va">_BATCH_SIZE</span>):
+            <span class="kw">yield</span> <span class="va">data</span>[<span class="va">i</span> : <span class="va">i</span> <span class="op">+</span> <span class="va">_BATCH_SIZE</span>]</code></pre>
+
+<p>
+Because the data is already an in-memory list, <code>ScanNode</code>
+can just slice it directly — no need for the <code>_batched()</code>
+helper. That helper is used by <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" class="source-link" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a>, which
+reads from generators (like a file reader) where you can't slice but
+can <code>islice</code>.
+</p>
+
+<div class="comparison-grid">
+  <div class="comparison-card">
+    <h4><span class="dot dot-naive" style="width:9px;height:9px;"></span> Row-at-a-time</h4>
+    <p>Each <code>next()</code> crosses the generator boundary. For N rows across K nodes: <strong>N × K</strong> function calls.</p>
+  </div>
+  <div class="comparison-card">
+    <h4><span class="dot dot-better" style="width:9px;height:9px;"></span> Batched (1,024)</h4>
+    <p>Each <code>next()</code> yields 1,024 rows. Same pipeline: <strong>N/1024 × K</strong> function calls. Inner loop runs as a fast list comprehension.</p>
+  </div>
+</div>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  In Polars, the equivalent of our batch is an Arrow "chunk" — a
+  contiguous block of memory holding thousands of values in columnar
+  format. Polars applies SIMD instructions to process entire chunks at
+  once. Our Python batches don't get SIMD, but the <em>architectural
+  idea</em> is identical: reduce the number of times you cross a function
+  boundary, and do as much work as possible inside tight inner loops.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 3.4 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-4">
+  <span class="lesson-num">Lesson 3.4</span>
+  The LazyFrame Wrapper
+</h2>
+
+<p>
+We now have a working engine: expressions compile into fast closures,
+plan nodes process data in batches, and generators chain everything
+together. But the user-facing API is still rough. To build a pipeline
+today, you'd write something like:
+</p>
+
+<div class="code-label"><span class="dot dot-naive"></span> Wiring plan nodes by hand — painful</div>
+<pre><code><span class="va">scan</span> <span class="op">=</span> ScanNode(<span class="va">data</span>, [<span class="st">"name"</span>, <span class="st">"age"</span>, <span class="st">"city"</span>])
+<span class="va">filt</span> <span class="op">=</span> FilterNode(<span class="va">scan</span>, col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">28</span>)
+<span class="va">proj</span> <span class="op">=</span> ProjectNode(<span class="va">filt</span>, [<span class="st">"name"</span>, <span class="st">"age"</span>])
+
+<span class="cm"># Collect results manually</span>
+<span class="va">results</span> <span class="op">=</span> []
+<span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">proj</span>.execute_batched():
+    <span class="va">results</span>.extend(<span class="va">chunk</span>)</code></pre>
+
+<p>
+This is the engine's internal wiring exposed to the user — and it's
+terrible. Every operation creates a raw node. The user has to remember
+which node takes which arguments. There's no method chaining, no
+<code>.collect()</code>, no fluent API. Compare this to what a Polars
+user writes:
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> What we want — a fluent API</div>
+<pre><code><span class="va">result</span> <span class="op">=</span> (
+    LazyFrame(<span class="va">data</span>)
+    .filter(col(<span class="st">"age"</span>) <span class="op">&gt;</span> <span class="nu">28</span>)
+    .select(<span class="st">"name"</span>, <span class="st">"age"</span>)
+    .collect()
+)</code></pre>
+
+<details class="recall">
+  <summary>Recall from Module 1 — our first LazyFrame sketch</summary>
+  <div class="recall-body">
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">plan_node</span>: <span class="cl">PlanNode</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>._plan <span class="op">=</span> <span class="va">plan_node</span>
+
+    <span class="kw">def</span> <span class="fn">filter</span>(<span class="va">self</span>, <span class="va">condition</span>: <span class="cl">Callable</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="va">new_plan</span> <span class="op">=</span> FilterNode(<span class="va">self</span>._plan, <span class="va">condition</span>)
+        <span class="kw">return</span> LazyFrame(<span class="va">new_plan</span>)
+
+    <span class="kw">def</span> <span class="fn">collect</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="va">list</span>[<span class="va">tuple</span>]:
+        <span class="kw">return</span> <span class="fn">list</span>(<span class="va">self</span>._plan.execute())</code></pre>
+    <p class="recall-note">
+      Module 1's version accepted a raw plan node and used lambdas. Now
+      we'll accept user data directly, use expressions, handle batched
+      execution, and add <code>_from_plan</code> for internal construction.
+    </p>
+  </div>
+</details>
+
+<p>
+The <code>LazyFrame</code> is the thin wrapper that bridges the gap. It
+holds a plan tree internally, and each method call just wraps the
+current plan in a new node:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Our LazyFrame — a thin wrapper over the plan tree</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">data</span>: <span class="va">list</span>[<span class="va">dict</span>]) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="cm"># Convert list-of-dicts to internal format</span>
+        <span class="va">columns</span>, <span class="va">rows</span> <span class="op">=</span> <span class="fn">dicts_to_tuples</span>(<span class="va">data</span>)
+        <span class="va">self</span>._plan <span class="op">=</span> ScanNode(<span class="va">rows</span>, <span class="va">columns</span>)
+
+    <span class="kw">def</span> <span class="fn">filter</span>(<span class="va">self</span>, <span class="va">predicate</span>: <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="cm"># Don't execute — just wrap in a new node!</span>
+        <span class="kw">return</span> LazyFrame._from_plan(
+            FilterNode(<span class="va">self</span>._plan, <span class="va">predicate</span>))
+
+    <span class="kw">def</span> <span class="fn">select</span>(<span class="va">self</span>, <span class="op">*</span><span class="va">columns</span>: <span class="va">str</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="kw">return</span> LazyFrame._from_plan(
+            ProjectNode(<span class="va">self</span>._plan, <span class="fn">list</span>(<span class="va">columns</span>)))
+
+    <span class="kw">def</span> <span class="fn">collect</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="cm"># NOW we execute — pull all data through the plan</span>
+        <span class="va">data</span> <span class="op">=</span> []
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>._plan.execute_batched():
+            <span class="va">data</span>.extend(<span class="va">chunk</span>)
+        <span class="va">self</span>._materialized <span class="op">=</span> <span class="va">data</span>
+        <span class="kw">return</span> <span class="va">self</span></code></pre>
+
+<p>
+Look at <code>.filter()</code>: it doesn't touch any data. It creates a
+<code>FilterNode</code> that wraps the current plan, then returns a
+<em>new</em> <code>LazyFrame</code> pointing at this deeper plan tree.
+Each method call adds one node on top. The tree grows downward.
+<code>.collect()</code> is the only method that triggers execution — it
+pulls data up through the entire chain.
+</p>
+
+<h3>The <code>_from_plan</code> classmethod</h3>
+
+<p>
+Notice that <code>.filter()</code> doesn't call
+<code>LazyFrame.__init__()</code> — that would try to convert data
+from dicts again. Instead, it calls <code>_from_plan</code>, a
+classmethod that creates a <code>LazyFrame</code> directly from an
+existing plan node:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> _from_plan — construct without __init__</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="dc">@classmethod</span>
+    <span class="kw">def</span> <span class="fn">_from_plan</span>(<span class="va">cls</span>, <span class="va">plan</span>: <span class="cl">PlanNode</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="va">lf</span> <span class="op">=</span> <span class="va">cls</span>.<span class="fn">__new__</span>(<span class="va">cls</span>)  <span class="cm"># create instance, skip __init__</span>
+        <span class="va">lf</span>._plan <span class="op">=</span> <span class="va">plan</span>
+        <span class="va">lf</span>._materialized <span class="op">=</span> <span class="kw">None</span>
+        <span class="kw">return</span> <span class="va">lf</span></code></pre>
+
+<p>
+<code>cls.__new__(cls)</code> creates a bare instance without calling
+<code>__init__</code>. Then we set the attributes directly. This is a
+common pattern in libraries that have two distinct construction paths:
+one for end users (from raw data) and one for internal plumbing (from
+an existing plan).
+</p>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Every method is a node constructor</div>
+  This is the key insight about lazy APIs: <em>every method on
+  <code>LazyFrame</code> is secretly a plan node constructor.</em>
+  <code>.filter()</code> creates a <code>FilterNode</code>.
+  <code>.select()</code> creates a <code>ProjectNode</code>.
+  <code>.with_column()</code> creates a <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" class="source-link" target="_blank" rel="noopener"><code>WithColumnNode</code></a>.
+  The user thinks they're "doing" something to the data; in reality,
+  they're building a tree of instructions that will execute later.
+</div>
+
+<p>
+Now let's look at pyfloe's actual <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a>:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's LazyFrame (core.py) — key methods</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazyFrame</span>:
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"_plan"</span>, <span class="st">"_materialized"</span>, <span class="st">"_name"</span>, <span class="st">"_optimized"</span>)
+
+    <span class="kw">def</span> <span class="fn">filter</span>(<span class="va">self</span>, <span class="va">predicate</span>: <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="kw">return</span> LazyFrame._from_plan(
+            FilterNode(<span class="va">self</span>._plan, <span class="va">predicate</span>))
+
+    <span class="kw">def</span> <span class="fn">select</span>(<span class="va">self</span>, <span class="op">*</span><span class="va">args</span>: <span class="va">str</span> <span class="op">|</span> <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="kw">if</span> <span class="fn">all</span>(<span class="fn">isinstance</span>(<span class="va">a</span>, <span class="va">str</span>) <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">args</span>):
+            <span class="kw">return</span> LazyFrame._from_plan(
+                ProjectNode(<span class="va">self</span>._plan, <span class="fn">list</span>(<span class="va">args</span>)))
+        <span class="va">exprs</span> <span class="op">=</span> [Col(<span class="va">a</span>) <span class="kw">if</span> <span class="fn">isinstance</span>(<span class="va">a</span>, <span class="va">str</span>) <span class="kw">else</span> <span class="va">a</span>
+                 <span class="kw">for</span> <span class="va">a</span> <span class="kw">in</span> <span class="va">args</span>]
+        <span class="kw">return</span> LazyFrame._from_plan(
+            ProjectNode(<span class="va">self</span>._plan, exprs<span class="op">=</span><span class="va">exprs</span>))
+
+    <span class="kw">def</span> <span class="fn">with_column</span>(<span class="va">self</span>, <span class="va">name</span>: <span class="va">str</span>, <span class="va">expr</span>: <span class="cl">Expr</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="kw">return</span> LazyFrame._from_plan(
+            WithColumnNode(<span class="va">self</span>._plan, <span class="va">name</span>, <span class="va">expr</span>))
+
+    <span class="kw">def</span> <span class="fn">collect</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazyFrame</span>:
+        <span class="kw">if</span> <span class="va">self</span>._materialized <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="va">plan</span> <span class="op">=</span> <span class="va">self</span>._exec_plan  <span class="cm"># optimized!</span>
+            <span class="va">data</span> <span class="op">=</span> []
+            <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">plan</span>.execute_batched():
+                <span class="va">data</span>.extend(<span class="va">chunk</span>)
+            <span class="va">self</span>._materialized <span class="op">=</span> <span class="va">data</span>
+        <span class="kw">return</span> <span class="va">self</span></code></pre>
+
+<p>
+Beyond our simplified version, pyfloe adds:
+</p>
+
+<p>
+<strong><code>__slots__</code></strong> — Again, eliminating the
+instance <code>__dict__</code>. A <code>LazyFrame</code> stores
+just four things: the plan, cached data, a name, and an optimized
+plan.
+</p>
+
+<p>
+<strong><code>.select()</code> with mixed arguments</strong> — If all
+arguments are strings, it does column selection (fast path). If any
+are expressions, it converts string arguments to <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a>
+objects and does expression evaluation. This lets users mix both:
+<code>.select("name", (col("price") * col("qty")).alias("total"))</code>.
+</p>
+
+<p>
+<strong><code>_exec_plan</code></strong> — When you call
+<code>.collect()</code>, pyfloe doesn't just execute the raw plan — it
+runs the optimizer first (which we'll build in Module 5). The
+<code>_exec_plan</code> property caches the optimized plan so it's
+only computed once.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">In the wild</div>
+  Polars' <code>LazyFrame</code> works identically: each method returns
+  a new <code>LazyFrame</code> with a deeper plan tree.
+  <code>.collect()</code> triggers the optimizer and then the executor.
+  The only difference is implementation language: Polars' plan nodes are
+  Rust structs, and <code>.collect()</code> triggers a Rust-native
+  execution engine. But the Python-level pattern — the thin wrapper, the
+  plan tree, the deferred execution — is the same.
+</div>
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- LESSON 3.5 -->
+<!-- ============================================================ -->
+
+<h2 id="lesson-5">
+  <span class="lesson-num">Lesson 3.5</span>
+  Schema Propagation Without Data
+</h2>
+
+<p>
+Here's a question that might seem impossible to answer: if a
+<code>LazyFrame</code> hasn't executed yet — no data has flowed, no
+rows have been processed — how can it know what its output columns and
+types are?
+</p>
+
+<div class="code-label"><span class="dot dot-python"></span> Schema without data — how?</div>
+<pre><code><span class="va">pipeline</span> <span class="op">=</span> (
+    LazyFrame(<span class="va">orders</span>)
+    .filter(col(<span class="st">"amount"</span>) <span class="op">&gt;</span> <span class="nu">100</span>)
+    .with_column(<span class="st">"tax"</span>, col(<span class="st">"amount"</span>) <span class="op">*</span> <span class="nu">0.2</span>)
+    .select(<span class="st">"order_id"</span>, <span class="st">"amount"</span>, <span class="st">"tax"</span>)
+)
+
+<span class="va">pipeline</span>.schema   <span class="cm"># ← How does this work? No data has flowed!</span></code></pre>
+
+<p>
+And yet, Polars does exactly this. You can call <code>.schema</code>
+on a lazy pipeline and get instant answers — column names, types,
+nullability — without triggering execution. It's one of the most
+useful features for interactive development: catch column typos and
+type mismatches <em>before</em> waiting for a query to run.
+</p>
+
+<p>
+The trick: <strong>every plan node knows how to compute its output
+schema from its input schema</strong>. The schema propagates
+<strong>bottom-up</strong>: leaf nodes like <code>ScanNode</code> know
+their columns from the data source, and every node above derives its
+schema from its children. The entire propagation happens instantly,
+by walking the tree's structure alone &mdash; no data flows at all.
+</p>
+
+<h3>Building ColumnSchema</h3>
+
+<p>
+We need a way to describe a single column — its name, type, and
+whether it can contain <code>None</code>. pyfloe uses a frozen
+dataclass for this:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's ColumnSchema (schema.py)</div>
+<pre><code><span class="kw">from</span> <span class="cl">dataclasses</span> <span class="kw">import</span> <span class="fn">dataclass</span>
+
+<span class="dc">@dataclass</span>(frozen<span class="op">=</span><span class="kw">True</span>)
+<span class="kw">class</span> <span class="cl">ColumnSchema</span>:
+    <span class="va">name</span>: <span class="va">str</span>
+    <span class="va">dtype</span>: <span class="va">type</span> <span class="op">=</span> <span class="va">str</span>
+    <span class="va">nullable</span>: <span class="va">bool</span> <span class="op">=</span> <span class="kw">True</span>
+
+    <span class="kw">def</span> <span class="fn">with_name</span>(<span class="va">self</span>, <span class="va">name</span>: <span class="va">str</span>) <span class="op">-&gt;</span> <span class="cl">ColumnSchema</span>:
+        <span class="kw">return</span> ColumnSchema(<span class="va">name</span>, <span class="va">self</span>.dtype, <span class="va">self</span>.nullable)
+
+    <span class="kw">def</span> <span class="fn">with_dtype</span>(<span class="va">self</span>, <span class="va">dtype</span>: <span class="va">type</span>) <span class="op">-&gt;</span> <span class="cl">ColumnSchema</span>:
+        <span class="kw">return</span> ColumnSchema(<span class="va">self</span>.name, <span class="va">dtype</span>, <span class="va">self</span>.nullable)</code></pre>
+
+<p>
+<strong><code>frozen=True</code></strong> means the dataclass is
+immutable — once created, its fields can't be changed. This is
+important because schemas are shared across the plan tree; you don't
+want one node's schema modification to accidentally affect another
+node. The <code>with_name()</code> and <code>with_dtype()</code>
+methods follow the immutable pattern: they return new objects instead
+of modifying the existing one.
+</p>
+
+<h3>Building LazySchema</h3>
+
+<p>
+A <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" class="source-link" target="_blank" rel="noopener"><code>LazySchema</code></a> is a collection of <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20ColumnSchema" class="source-link" target="_blank" rel="noopener"><code>ColumnSchema</code></a>
+objects — one per column, in order. It's the schema for an entire plan
+node's output:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> pyfloe's LazySchema (schema.py) — core structure</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazySchema</span>:
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">'_columns'</span>,)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">columns</span>: <span class="va">dict</span>[<span class="va">str</span>, <span class="cl">ColumnSchema</span>] <span class="op">|</span> <span class="kw">None</span> <span class="op">=</span> <span class="kw">None</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>._columns <span class="op">=</span> <span class="va">columns</span> <span class="kw">or</span> {}
+
+    <span class="dc">@property</span>
+    <span class="kw">def</span> <span class="fn">column_names</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="va">list</span>[<span class="va">str</span>]:
+        <span class="kw">return</span> <span class="fn">list</span>(<span class="va">self</span>._columns.keys())
+
+    <span class="dc">@property</span>
+    <span class="kw">def</span> <span class="fn">dtypes</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="va">dict</span>[<span class="va">str</span>, <span class="va">type</span>]:
+        <span class="kw">return</span> {<span class="va">n</span>: <span class="va">c</span>.dtype <span class="kw">for</span> <span class="va">n</span>, <span class="va">c</span> <span class="kw">in</span> <span class="va">self</span>._columns.items()}</code></pre>
+
+<p>
+<code>LazySchema</code> uses <code>__slots__</code> too — it stores
+just one thing, the ordered dictionary of columns. Now we need methods
+that let plan nodes derive new schemas from existing ones:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> LazySchema — transformation methods</div>
+<pre><code><span class="kw">class</span> <span class="cl">LazySchema</span>:
+    <span class="cm"># ...continued</span>
+
+    <span class="kw">def</span> <span class="fn">select</span>(<span class="va">self</span>, <span class="va">columns</span>: <span class="va">list</span>[<span class="va">str</span>]) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="st">"""Keep only the named columns."""</span>
+        <span class="kw">return</span> LazySchema({<span class="va">n</span>: <span class="va">self</span>._columns[<span class="va">n</span>]
+                           <span class="kw">for</span> <span class="va">n</span> <span class="kw">in</span> <span class="va">columns</span>})
+
+    <span class="kw">def</span> <span class="fn">with_column</span>(<span class="va">self</span>, <span class="va">name</span>: <span class="va">str</span>, <span class="va">dtype</span>: <span class="va">type</span>, <span class="va">nullable</span>: <span class="va">bool</span> <span class="op">=</span> <span class="kw">True</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="st">"""Return schema with one column added or replaced."""</span>
+        <span class="va">cols</span> <span class="op">=</span> <span class="fn">dict</span>(<span class="va">self</span>._columns)
+        <span class="va">cols</span>[<span class="va">name</span>] <span class="op">=</span> ColumnSchema(<span class="va">name</span>, <span class="va">dtype</span>, <span class="va">nullable</span>)
+        <span class="kw">return</span> LazySchema(<span class="va">cols</span>)
+
+    <span class="kw">def</span> <span class="fn">merge</span>(<span class="va">self</span>, <span class="va">other</span>: <span class="cl">LazySchema</span>, <span class="va">suffix</span>: <span class="va">str</span> <span class="op">=</span> <span class="st">'right_'</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="st">"""Merge two schemas (for joins)."""</span>
+        <span class="va">cols</span> <span class="op">=</span> <span class="fn">dict</span>(<span class="va">self</span>._columns)
+        <span class="kw">for</span> <span class="va">name</span>, <span class="va">col</span> <span class="kw">in</span> <span class="va">other</span>._columns.items():
+            <span class="kw">if</span> <span class="va">name</span> <span class="kw">in</span> <span class="va">cols</span>:
+                <span class="va">new_name</span> <span class="op">=</span> <span class="va">suffix</span> <span class="op">+</span> <span class="va">name</span>
+                <span class="va">cols</span>[<span class="va">new_name</span>] <span class="op">=</span> <span class="va">col</span>.with_name(<span class="va">new_name</span>)
+            <span class="kw">else</span>:
+                <span class="va">cols</span>[<span class="va">name</span>] <span class="op">=</span> <span class="va">col</span>
+        <span class="kw">return</span> LazySchema(<span class="va">cols</span>)</code></pre>
+
+<p>
+Every method returns a <em>new</em> <code>LazySchema</code> — the
+original is never modified. This immutability is crucial: a
+<code>FilterNode</code> and the <code>ProjectNode</code> above it can
+both reference the same child node's schema without stepping on each
+other.
+</p>
+
+<h3>Wiring schema into plan nodes</h3>
+
+<p>
+Now the payoff. Each plan node implements a <code>.schema()</code>
+method that computes its output schema by transforming its child's
+schema. The rules are intuitive:
+</p>
+
+<div class="code-label"><span class="dot dot-better"></span> Schema propagation rules</div>
+<pre><code><span class="kw">class</span> <span class="cl">FilterNode</span>(<span class="cl">PlanNode</span>):
+    <span class="kw">def</span> <span class="fn">schema</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="kw">return</span> <span class="va">self</span>.child.schema()  <span class="cm"># same columns, fewer rows</span>
+
+<span class="kw">class</span> <span class="cl">ProjectNode</span>(<span class="cl">PlanNode</span>):
+    <span class="kw">def</span> <span class="fn">schema</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="kw">if</span> <span class="va">self</span>._columns:
+            <span class="kw">return</span> <span class="va">self</span>.child.schema().select(<span class="va">self</span>._columns)
+        <span class="cm"># For expressions: infer type of each</span>
+        <span class="va">parent</span> <span class="op">=</span> <span class="va">self</span>.child.schema()
+        <span class="va">cols</span> <span class="op">=</span> {}
+        <span class="kw">for</span> <span class="va">expr</span> <span class="kw">in</span> <span class="va">self</span>._exprs:
+            <span class="va">name</span> <span class="op">=</span> <span class="va">expr</span>.output_name()
+            <span class="va">dtype</span> <span class="op">=</span> <span class="va">expr</span>.output_dtype(<span class="va">parent</span>)
+            <span class="va">cols</span>[<span class="va">name</span>] <span class="op">=</span> ColumnSchema(<span class="va">name</span>, <span class="va">dtype</span>)
+        <span class="kw">return</span> LazySchema(<span class="va">cols</span>)
+
+<span class="kw">class</span> <span class="cl">WithColumnNode</span>(<span class="cl">PlanNode</span>):
+    <span class="kw">def</span> <span class="fn">schema</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="va">parent</span> <span class="op">=</span> <span class="va">self</span>.child.schema()
+        <span class="va">dtype</span> <span class="op">=</span> <span class="va">self</span>._expr.output_dtype(<span class="va">parent</span>)
+        <span class="kw">return</span> <span class="va">parent</span>.with_column(<span class="va">self</span>._name, <span class="va">dtype</span>)</code></pre>
+
+<p>
+Look at what's happening: <strong>no data is involved</strong>.
+<code>FilterNode.schema()</code> just passes through its child's
+schema (filtering doesn't change columns). <code>ProjectNode.schema()</code>
+calls <code>.select()</code> on the child's schema to keep only the
+requested columns. <code>WithColumnNode.schema()</code> calls
+<code>.with_column()</code> to append a new column with the type that
+<code>Expr.output_dtype()</code> infers.
+</p>
+
+<p>
+And here's where the expression AST from Module 2 closes the loop.
+Remember how every <code>Expr</code> subclass implements
+<code>output_dtype()</code>?
+</p>
+
+<details class="recall">
+  <summary>Recall from Module 2 — output_dtype() on each Expr node</summary>
+  <div class="recall-body">
+<pre><code><span class="kw">class</span> <span class="cl">Col</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">output_dtype</span>(<span class="va">self</span>, <span class="va">schema</span>: <span class="cl">LazySchema</span>) <span class="op">-&gt;</span> <span class="va">type</span>:
+        <span class="kw">return</span> <span class="va">schema</span>[<span class="va">self</span>.name].dtype  <span class="cm"># look up from schema</span>
+
+<span class="kw">class</span> <span class="cl">Lit</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">output_dtype</span>(<span class="va">self</span>, <span class="va">schema</span>: <span class="cl">LazySchema</span>) <span class="op">-&gt;</span> <span class="va">type</span>:
+        <span class="kw">return</span> <span class="fn">type</span>(<span class="va">self</span>.value)        <span class="cm"># type of the constant</span>
+
+<span class="kw">class</span> <span class="cl">BinaryExpr</span>(<span class="cl">Expr</span>):
+    <span class="kw">def</span> <span class="fn">output_dtype</span>(<span class="va">self</span>, <span class="va">schema</span>: <span class="cl">LazySchema</span>) <span class="op">-&gt;</span> <span class="va">type</span>:
+        <span class="kw">if</span> <span class="va">self</span>.op_str <span class="kw">in</span> (<span class="st">'>'</span>, <span class="st">'&lt;'</span>, <span class="st">'=='</span>, <span class="st">'!='</span>, <span class="st">'&amp;'</span>, <span class="st">'|'</span>):
+            <span class="kw">return</span> <span class="va">bool</span>          <span class="cm"># comparisons → bool</span>
+        <span class="kw">return</span> <span class="va">self</span>.left.output_dtype(<span class="va">schema</span>)  <span class="cm"># arithmetic → left type</span></code></pre>
+    <p class="recall-note">
+      Each expression node knows its output type without seeing any data.
+      <code>Col</code> looks it up in the schema. <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> uses
+      <code>type()</code>. <code>BinaryExpr</code> returns <code>bool</code>
+      for comparisons and inherits from the left operand for arithmetic.
+    </p>
+  </div>
+</details>
+
+<div class="code-label"><span class="dot dot-python"></span> Expression type inference — no data needed</div>
+<pre><code><span class="cm"># Col looks up the type from the schema</span>
+<span class="va">col</span>(<span class="st">"amount"</span>).output_dtype(<span class="va">schema</span>)  <span class="cm"># → float (from schema)</span>
+
+<span class="cm"># BinaryExpr with comparison → always bool</span>
+(col(<span class="st">"amount"</span>) <span class="op">&gt;</span> <span class="nu">100</span>).output_dtype(<span class="va">schema</span>)  <span class="cm"># → bool</span>
+
+<span class="cm"># BinaryExpr with arithmetic → inherits from left operand</span>
+(col(<span class="st">"amount"</span>) <span class="op">*</span> <span class="nu">0.2</span>).output_dtype(<span class="va">schema</span>)  <span class="cm"># → float</span></code></pre>
+
+<p>
+The schema walks the plan tree from top to bottom to find the leaf's
+schema (which is known from the data), then propagates it back up
+through each node's <code>.schema()</code> method. It's recursive, but
+the recursion depth equals the number of plan nodes — usually less
+than 20 — so it's effectively instant.
+</p>
+
+<div class="aside callout-teal">
+  <div class="aside-title">How Polars does this</div>
+  This is exactly how Polars' <code>.schema</code> property works.
+  When you write <code>pipeline.schema</code> in Polars, no data
+  flows. Polars walks the plan tree, computing each node's output
+  schema from the node below it. That's how it can tell you
+  instantly that your join will produce a <code>right_id</code> column,
+  or that <code>col("price") * 0.2</code> will be a float — before
+  scanning a single row.
+</div>
+
+<h3>Inferring schema from data</h3>
+
+<p>
+The leaf node — typically <code>ScanNode</code> — needs an initial
+schema. If the user doesn't provide one, pyfloe infers it by sampling
+the data:
+</p>
+
+<div class="code-label"><span class="dot dot-pyfloe"></span> LazySchema.from_data() — infer types from a sample</div>
+<pre><code><span class="dc">@classmethod</span>
+<span class="kw">def</span> <span class="fn">from_data</span>(<span class="va">cls</span>, <span class="va">columns</span>: <span class="va">list</span>[<span class="va">str</span>], <span class="va">rows</span>: <span class="va">list</span>[<span class="va">tuple</span>]) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+    <span class="kw">if not</span> <span class="va">rows</span>:
+        <span class="kw">return</span> <span class="va">cls</span>({<span class="va">n</span>: ColumnSchema(<span class="va">n</span>) <span class="kw">for</span> <span class="va">n</span> <span class="kw">in</span> <span class="va">columns</span>})
+    <span class="va">sample</span> <span class="op">=</span> <span class="va">rows</span>[:<span class="fn">min</span>(<span class="nu">1000</span>, <span class="fn">len</span>(<span class="va">rows</span>))]
+    <span class="va">cols</span> <span class="op">=</span> {}
+    <span class="kw">for</span> <span class="va">i</span>, <span class="va">name</span> <span class="kw">in</span> <span class="fn">enumerate</span>(<span class="va">columns</span>):
+        <span class="va">dtype</span> <span class="op">=</span> <span class="va">str</span>
+        <span class="va">nullable</span> <span class="op">=</span> <span class="kw">False</span>
+        <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">sample</span>:
+            <span class="va">val</span> <span class="op">=</span> <span class="va">row</span>[<span class="va">i</span>]
+            <span class="kw">if</span> <span class="va">val</span> <span class="kw">is</span> <span class="kw">None</span>:
+                <span class="va">nullable</span> <span class="op">=</span> <span class="kw">True</span>
+            <span class="kw">elif</span> <span class="va">dtype</span> <span class="kw">is</span> <span class="va">str</span>:
+                <span class="va">dtype</span> <span class="op">=</span> <span class="fn">type</span>(<span class="va">val</span>)
+        <span class="va">cols</span>[<span class="va">name</span>] <span class="op">=</span> ColumnSchema(<span class="va">name</span>, <span class="va">dtype</span>, <span class="va">nullable</span>)
+    <span class="kw">return</span> <span class="va">cls</span>(<span class="va">cols</span>)</code></pre>
+
+<p>
+It examines up to 1,000 rows for in-memory data (100 for file readers),
+checking each column for its Python type and whether <code>None</code> appears. The default type is
+<code>str</code> (the safest assumption), which gets overridden the
+moment a non-None value is encountered. pyfloe also has a separate
+<code>from_dicts()</code> classmethod for when data arrives as
+dictionaries — but the logic is essentially the same.
+</p>
+
+<div class="aside callout-purple">
+  <div class="aside-title">Coming in Module 5</div>
+  Schema propagation isn't just a nice developer feature — it's
+  <em>essential</em> for the optimizer. In Module 5, the column pruning
+  pass will ask each plan node "what columns do you actually need?" by
+  walking the schemas. Without <code>LazySchema</code>, the optimizer
+  would have no way to know which columns are safe to drop.
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- EXERCISES -->
+<!-- ============================================================ -->
+
+<h2 id="exercises">
+  <span class="lesson-num">Exercises</span>
+  Test Your Understanding
+</h2>
+
+<div class="interactive-box">
+  <h4>Quiz: The Engine Room</h4>
+
+  <div id="q1" class="quiz-question">
+    <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+      1. Why does pyfloe's <code>FilterNode</code> call <code>predicate.compile(col_map)</code> instead of using <code>predicate.eval(row, col_map)</code> inside the loop?
+    </p>
+    <div class="btn-row">
+      <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">To support more expression types</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(1, this, true)"><code>compile()</code> resolves the tree once; <code>eval()</code> walks it per row</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)">To make the code shorter</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(1, this, false)"><code>eval()</code> doesn't work with tuples</button>
+    </div>
+    <div id="feedback-1" class="output-box" style="display: none;"></div>
+  </div>
+
+  <div id="q2" class="quiz-question" style="margin-top: 24px;">
+    <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+      2. What happens when you call <code>LazyFrame.filter(col("age") > 28)</code>?
+    </p>
+    <div class="btn-row">
+      <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">It scans the data and removes non-matching rows</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">It compiles the expression and stores the result</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(2, this, true)">It wraps the current plan in a <code>FilterNode</code> and returns a new <code>LazyFrame</code></button>
+      <button class="btn quiz-btn" onclick="checkAnswer(2, this, false)">It validates the column name against the schema</button>
+    </div>
+    <div id="feedback-2" class="output-box" style="display: none;"></div>
+  </div>
+
+  <div id="q3" class="quiz-question" style="margin-top: 24px;">
+    <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+      3. Why does pyfloe process rows in batches of 1,024 instead of one at a time?
+    </p>
+    <div class="btn-row">
+      <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">To use less total memory</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(3, this, true)">To amortize Python's per-call overhead across many rows</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">To enable parallel processing</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(3, this, false)">Because generators can only yield lists</button>
+    </div>
+    <div id="feedback-3" class="output-box" style="display: none;"></div>
+  </div>
+
+  <div id="q4" class="quiz-question" style="margin-top: 24px;">
+    <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+      4. How does <code>FilterNode.schema()</code> compute its output schema?
+    </p>
+    <div class="btn-row">
+      <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It runs the filter and checks what columns survive</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(4, this, true)">It returns its child's schema unchanged — filtering doesn't change columns</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It removes columns not mentioned in the predicate</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(4, this, false)">It creates a new schema with just the predicate's required columns</button>
+    </div>
+    <div id="feedback-4" class="output-box" style="display: none;"></div>
+  </div>
+
+  <div id="q5" class="quiz-question" style="margin-top: 24px;">
+    <p style="font-family: var(--sans); font-size: 15px; font-weight: 500; margin-bottom: 12px;">
+      5. What does <code>PlanNode.execute()</code> return, and how does it relate to <code>execute_batched()</code>?
+    </p>
+    <div class="btn-row">
+      <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">A list of all rows; it calls <code>execute_batched()</code> and concatenates</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(5, this, true)">An iterator of individual rows, via <code>chain.from_iterable(execute_batched())</code></button>
+      <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">The same thing as <code>execute_batched()</code> — they're aliases</button>
+      <button class="btn quiz-btn" onclick="checkAnswer(5, this, false)">A generator that yields one batch, then stops</button>
+    </div>
+    <div id="feedback-5" class="output-box" style="display: none;"></div>
+  </div>
+</div>
+
+
+<!-- ============================================================ -->
+<!-- HANDS-ON EXERCISE -->
+<!-- ============================================================ -->
+
+<div class="interactive-box" style="margin-top: 36px;">
+  <h4>Hands-On Challenge: Build a LimitNode</h4>
+
+  <p style="font-family: var(--sans); font-size: 14.5px; line-height: 1.7; margin-bottom: 16px;">
+    Implement a <code>LimitNode</code> that stops pulling after N rows —
+    the equivalent of SQL's <code>LIMIT</code> or Polars'
+    <code>.head()</code>. Think about:
+  </p>
+
+  <p style="font-family: var(--sans); font-size: 14.5px; line-height: 1.7;">
+    <strong>1.</strong> It should work with <code>execute_batched()</code>.
+    What happens when the limit falls in the middle of a batch?<br>
+    <strong>2.</strong> What should <code>.schema()</code> return? (Hint:
+    limiting rows doesn't change columns.)<br>
+    <strong>3.</strong> The key insight: once you've yielded enough rows,
+    you can <code>return</code> from the generator — which tells the
+    entire upstream chain to stop pulling. This is the early termination
+    property from Module 1, applied to batched execution.
+  </p>
+
+  <button class="btn" onclick="toggleSolution()" style="margin-top: 16px;">Show Solution</button>
+
+  <div id="solution" style="display: none; margin-top: 16px;">
+    <div class="code-label"><span class="dot dot-better"></span> LimitNode — early termination with batches</div>
+<pre><code><span class="kw">class</span> <span class="cl">LimitNode</span>(<span class="cl">PlanNode</span>):
+    <span class="va">__slots__</span> <span class="op">=</span> (<span class="st">"child"</span>, <span class="st">"_limit"</span>)
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="va">self</span>, <span class="va">child</span>: <span class="cl">PlanNode</span>, <span class="va">limit</span>: <span class="va">int</span>) <span class="op">-&gt;</span> <span class="kw">None</span>:
+        <span class="va">self</span>.child <span class="op">=</span> <span class="va">child</span>
+        <span class="va">self</span>._limit <span class="op">=</span> <span class="va">limit</span>
+
+    <span class="kw">def</span> <span class="fn">schema</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">LazySchema</span>:
+        <span class="kw">return</span> <span class="va">self</span>.child.schema()  <span class="cm"># same columns</span>
+
+    <span class="kw">def</span> <span class="fn">execute_batched</span>(<span class="va">self</span>) <span class="op">-&gt;</span> <span class="cl">Iterator</span>[<span class="va">list</span>[<span class="va">tuple</span>]]:
+        <span class="va">remaining</span> <span class="op">=</span> <span class="va">self</span>._limit
+        <span class="kw">for</span> <span class="va">chunk</span> <span class="kw">in</span> <span class="va">self</span>.child.execute_batched():
+            <span class="kw">if</span> <span class="fn">len</span>(<span class="va">chunk</span>) <span class="op">&lt;=</span> <span class="va">remaining</span>:
+                <span class="kw">yield</span> <span class="va">chunk</span>
+                <span class="va">remaining</span> <span class="op">-=</span> <span class="fn">len</span>(<span class="va">chunk</span>)
+            <span class="kw">else</span>:
+                <span class="kw">yield</span> <span class="va">chunk</span>[:<span class="va">remaining</span>]
+                <span class="kw">return</span>  <span class="cm"># stop pulling entirely!</span>
+            <span class="kw">if</span> <span class="va">remaining</span> <span class="op">&lt;=</span> <span class="nu">0</span>:
+                <span class="kw">return</span></code></pre>
+
+  <p style="font-family: var(--sans); font-size: 14px; line-height: 1.7; margin-top: 12px; color: var(--text-muted);">
+    The <code>return</code> statement inside a generator causes it to
+    raise <code>StopIteration</code>, which tells the parent node (and
+    the entire chain above it) that there's no more data. The upstream
+    <code>ScanNode</code> pauses, and if it was reading from a file, the
+    file handle never reads another byte. That's early termination —
+    and it's free, thanks to Python's generator protocol.
+  </p>
+  </div>
+</div>
+
+
+<hr class="separator">
+
+
+<!-- ============================================================ -->
+<!-- CLIFFHANGER -->
+<!-- ============================================================ -->
+
+<div class="source-references">
+  <h4>Source References</h4>
+
+  <div class="ref-group">
+    <h5>plan.py — Plan Nodes</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" target="_blank" rel="noopener"><code>PlanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" target="_blank" rel="noopener"><code>WithColumnNode</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>core.py — LazyFrame API</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener"><code>LazyFrame</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>expr.py — Expression AST</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener"><code>BinaryExpr</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" target="_blank" rel="noopener"><code>Col</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" target="_blank" rel="noopener"><code>Lit</code></a></li>
+    </ul>
+  </div>
+
+  <div class="ref-group">
+    <h5>schema.py — Type System</h5>
+    <ul>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" target="_blank" rel="noopener"><code>LazySchema</code></a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20ColumnSchema" target="_blank" rel="noopener"><code>ColumnSchema</code></a></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const answers = {
+  1: {
+    correct: "Exactly. eval() walks the expression tree recursively for every single row — resolving Col nodes through the col_map dictionary each time. compile() does that tree walk once up front, producing a single closure with all indices pre-resolved. For a million rows, that's the difference between millions of dictionary lookups and zero.",
+    wrong: "Not quite. The key difference is performance: eval() walks the expression tree (dictionary lookups, method dispatch) for every row. compile() does that walk once and produces a single closure with pre-resolved indices. The resulting closure is much faster to call per row."
+  },
+  2: {
+    correct: "Exactly. No data flows. The .filter() method creates a FilterNode that wraps the current plan tree, then returns a new LazyFrame pointing at this deeper tree. The expression col(\"age\") > 28 is stored as an Expr object inside the node — it won't be compiled or evaluated until .collect() is called.",
+    wrong: "Not quite. Remember, LazyFrame is lazy — .filter() doesn't touch any data. It wraps the current plan in a new FilterNode and returns a new LazyFrame. Execution only happens when you call .collect(), .to_pylist(), or another materialization method."
+  },
+  3: {
+    correct: "Right. Each time a Python generator yields or a function is called, there's overhead (~100ns). Processing one row at a time means this overhead is paid per row. Batching 1,024 rows together means the generator yields once per batch instead of once per row — cutting overhead by a factor of 1,024. The inner processing loop runs as a fast list comprehension.",
+    wrong: "Not quite. Batching actually uses slightly more memory than row-at-a-time (each batch is a list of 1,024 tuples). The real benefit is reducing Python function call overhead. Each generator yield and function call costs ~100ns. Batching means we pay that cost once per 1,024 rows instead of once per row."
+  },
+  4: {
+    correct: "Exactly. A filter drops rows but never changes the columns or their types. So FilterNode.schema() simply returns self.child.schema() — a pass-through. This is why schema propagation works without data: each node applies a simple structural rule to its child's schema.",
+    wrong: "Not quite. Filtering only affects which rows survive — it never changes the columns. So FilterNode.schema() returns its child's schema unchanged. The predicate's required_columns() matters for the optimizer (Module 5), but not for the schema."
+  },
+  5: {
+    correct: "Exactly. execute() returns a lazy iterator of individual row tuples by calling chain.from_iterable(self.execute_batched()). This flattens the batched output (lists of tuples) into a flat stream of tuples. Subclasses only need to implement execute_batched() — the unbatched interface comes for free.",
+    wrong: "Not quite. execute() returns a lazy iterator (not a list) of individual rows. It works by calling chain.from_iterable() on execute_batched(), which flattens the stream of lists into a stream of individual tuples. This means subclasses only need to implement execute_batched() — the row-at-a-time interface is derived automatically."
+  }
+};
+
+function checkAnswer(q, btn, correct) {
+  const feedback = document.getElementById('feedback-' + q);
+  const btns = btn.parentElement.querySelectorAll('.quiz-btn');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+  btn.style.opacity = '1';
+
+  if (correct) {
+    btn.style.borderColor = '#0F6E56';
+    btn.style.background = '#E1F5EE';
+    btn.style.color = '#0F6E56';
+    feedback.className = 'output-box';
+    feedback.textContent = answers[q].correct;
+  } else {
+    btn.style.borderColor = '#A32D2D';
+    btn.style.background = '#FCEBEB';
+    btn.style.color = '#A32D2D';
+    feedback.className = 'output-box error';
+    feedback.textContent = answers[q].wrong;
+  }
+  feedback.style.display = 'block';
+}
+
+function toggleSolution() {
+  const el = document.getElementById('solution');
+  const btn = el.previousElementSibling;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    btn.textContent = 'Hide Solution';
+  } else {
+    el.style.display = 'none';
+    btn.textContent = 'Show Solution';
+  }
+}
+</script>

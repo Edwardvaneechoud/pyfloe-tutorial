@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/introduction.html?raw';
+---
+
+<CourseLayout title="Meet pyfloe" activeSlug="introduction" moduleBadge="Introduction">
+  <Fragment set:html={html} />
+</CourseLayout>

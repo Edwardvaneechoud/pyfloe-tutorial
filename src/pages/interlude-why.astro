@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/interlude-why.html?raw';
+---
+
+<CourseLayout title="Why I Think This Is Interesting" activeSlug="interlude-why" moduleBadge="Interlude">
+  <Fragment set:html={html} />
+</CourseLayout>

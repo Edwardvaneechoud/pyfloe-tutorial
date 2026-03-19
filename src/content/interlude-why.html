@@ -1,0 +1,212 @@
+<h1>Why I Think This<br>Is <em>Interesting</em></h1>
+
+<p class="subtitle">
+Before we start building anything, I want to tell you why this project
+exists &mdash; and why I think it teaches something that goes beyond Python.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION 1: It started with a real problem -->
+<!-- ============================================================ -->
+
+<h2>It started with a real problem</h2>
+
+<p>
+I built <a href="https://www.flowfile.io">Flowfile</a>, a visual data tool
+that lets people drag nodes on a canvas and build data pipelines without
+writing code. Under the hood, those pipelines need an engine. Something
+that takes a chain of operations &mdash; filter this, join that, aggregate
+here &mdash; and actually executes them.
+</p>
+
+<p>
+So I built one. From scratch. In pure Python. It's long since been
+replaced by Polars &mdash; which is faster by orders of magnitude &mdash;
+but the architecture survived the swap almost unchanged. That's not a
+coincidence, and it's part of why this course exists.
+</p>
+
+<p>
+The first version ran on <code>itertools</code> and
+<code>operator.itemgetter</code>. No AI, no autocomplete. Just the standard
+library, a lot of documentation reading, and a lot of getting things wrong
+before getting them right. That engine eventually became pyfloe &mdash; the
+library whose source code you'll be studying in this course.
+</p>
+
+<p>
+I'm telling you this because what follows isn't a hypothetical exercise.
+It's not "imagine you were building a query engine." Someone actually built
+this, for a real product, and hit every wall you'd expect: memory limits,
+performance cliffs, lambdas that couldn't be inspected, schemas that didn't
+propagate. The solutions we'll walk through aren't textbook answers. They're
+the answers I actually arrived at &mdash; sometimes on the first try, often
+not.
+</p>
+
+<p>
+In a way, this course is the documentation I wish I'd had when I started.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION 2: You're learning two things at once -->
+<!-- ============================================================ -->
+
+<h2>You're learning two things at once</h2>
+
+<p>
+On the surface, this course teaches Python. Good Python. The kind that shows
+up in well-maintained libraries: dunder methods, <code>__slots__</code>,
+iterator protocols, <code>defaultdict</code>, expression compilation. The
+stuff that separates "I can write Python" from "I understand how Python
+actually works under the hood."
+</p>
+
+<p>
+But underneath that, you're learning something bigger. You're learning how
+to think about <span class="highlight">computation as a structure you can
+inspect and rewrite</span>.
+</p>
+
+<p>
+That idea &mdash; that you don't just run code, you build a description of
+what you want and then decide how to run it later &mdash; is one of the
+most important patterns in computer science. It's the idea behind SQL query
+planners, which have worked this way since the 1970s. It's the idea behind
+lazy evaluation in Spark and Polars. It's the idea behind TensorFlow's
+computation graphs and PyTorch's autograd. It's the idea behind every
+modern compiler's intermediate representation.
+</p>
+
+<div class="aside callout-teal">
+<div class="aside-title">The big idea</div>
+When you write <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" class="source-link" target="_blank" rel="noopener"><code>col("price")</code></a> * col("qty") > <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" class="source-link" target="_blank" rel="noopener"><code>lit(100)</code></a> and it
+returns a tree of objects instead of a number, you're doing the same thing
+all of these systems do: separating the <em>what</em> from the <em>how</em>.
+Describing intent as data. Making computation inspectable.
+</div>
+
+<p>
+That's not a Python trick. That's a way of thinking. And once you see it,
+you start noticing it everywhere.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION 3: Why building from scratch matters -->
+<!-- ============================================================ -->
+
+<h2>Why building by hand matters</h2>
+
+<p>
+There's a version of this course that doesn't exist, where I just point you
+to the Polars source code and say "here's how it works." That would be
+faster. It would also be almost useless.
+</p>
+
+<p>
+Understanding doesn't come from reading. It comes from building something,
+watching it break, figuring out why, and building it again. There's a moment
+in this course where you'll write a perfectly reasonable
+<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> using a lambda &mdash; and then hit the wall. The
+optimizer can't inspect a lambda. It's a black box. You can't push a filter
+below a join if you don't know what columns the filter needs. And suddenly
+expression trees aren't an academic concept. They're the only way forward.
+</p>
+
+<p>
+That "oh, <em>that's</em> why it exists" feeling is what I chase in my
+work, my hobbies, and pretty much everything else. Not "here's a clever
+technique," but "here's the problem that makes the technique feel
+inevitable."
+</p>
+
+<div class="aside callout-orange">
+<div class="aside-title">Information vs. knowledge</div>
+And honestly, that's how you turn information into knowledge. Information is
+knowing that hash joins exist. Knowledge is having built one, hit the edge
+cases, and understanding when to reach for a sort-merge join instead. The
+aha moment is the bridge between the two, and there's no shortcut across it.
+</div>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION 4: The AI elephant in the room -->
+<!-- ============================================================ -->
+
+<h2>The AI elephant in the room</h2>
+
+<p>
+It's 2026. You can ask an LLM to write you a hash join and it'll produce
+something reasonable in a few seconds. I'm not going to pretend that's not
+the reality &mdash; I built a visual tool that generates code for people.
+</p>
+
+<p>
+But there's a difference between code you generated and code you understand.
+When Flowfile moved from my original Python engine to Polars, the
+architecture barely changed. Not because the architecture was brilliant
+&mdash; it was pretty standard, honestly &mdash; but because I understood
+<em>why</em> each piece existed. The decisions weren't arbitrary. They were
+load-bearing. You can swap an engine when you understand the structure. You
+can't swap anything when you're just prompting and hoping for the best.
+</p>
+
+<p>
+The stuff that becomes obsolete is the syntax. The stuff that lasts is the
+mental model. This course is about the mental model.
+</p>
+
+<hr class="separator">
+
+<!-- ============================================================ -->
+<!-- SECTION 5: What you're about to build -->
+<!-- ============================================================ -->
+
+<h2>What you're about to build</h2>
+
+<p>
+Over the next five modules you'll build a working lazy dataframe engine from
+scratch. Expressions, plan nodes, batched execution, hash joins,
+aggregation, and a query optimizer. The optimizer is the finale &mdash;
+about 80 lines of code that walk the plan tree and automatically eliminate
+waste. It's the payoff for everything before it, and it's surprisingly
+small. That's what good architecture does.
+</p>
+
+<p>
+pyfloe is roughly 6,000 lines of Python. Zero dependencies. No C
+extensions. No Rust. Just the standard library and a series of design
+decisions that I'll try to explain as we go. Where the code is clever, I'll
+show you why. Where I'd do it differently today, I'll tell you that too.
+</p>
+
+<div class="aside callout-purple">
+<div class="aside-title">Let's build something</div>
+Module 1 starts with the question every data tool has to answer first: why
+do DataFrames exist &mdash; and what goes wrong when you try to build one
+the obvious way?
+</div>
+
+<div class="source-references">
+  <h2>Source References</h2>
+  <div class="source-ref-group">
+    <h4>plan.py &mdash; Plan Nodes</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
+    </ul>
+  </div>
+  <div class="source-ref-group">
+    <h4>expr.py &mdash; Expression AST</h4>
+    <ul class="source-ref-list">
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" target="_blank" rel="noopener">col()</a></li>
+      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" target="_blank" rel="noopener">lit()</a></li>
+    </ul>
+  </div>
+</div>

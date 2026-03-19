@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/deep-dive-streaming.html?raw';
+---
+
+<CourseLayout title="Deep Dive: Streaming I/O" activeSlug="deep-dive-streaming" moduleBadge="Deep Dive">
+  <Fragment set:html={html} />
+</CourseLayout>

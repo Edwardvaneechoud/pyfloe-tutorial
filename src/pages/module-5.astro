@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/module-5.html?raw';
+---
+
+<CourseLayout title="The Query Optimizer (Capstone)" activeSlug="module-5" moduleBadge="Module 5 of 5">
+  <Fragment set:html={html} />
+</CourseLayout>

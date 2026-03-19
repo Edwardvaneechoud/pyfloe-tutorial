@@ -1,0 +1,8 @@
+---
+import CourseLayout from '../layouts/CourseLayout.astro';
+import html from '../content/interlude-wiring.html?raw';
+---
+
+<CourseLayout title="Wiring It All Together" activeSlug="interlude-wiring" moduleBadge="Interlude">
+  <Fragment set:html={html} />
+</CourseLayout>
