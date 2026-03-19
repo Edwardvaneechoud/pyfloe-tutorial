@@ -1,6 +1,9 @@
 ---
 import CourseLayout from '../layouts/CourseLayout.astro';
-import html from '../content/module-5.html?raw';
+import rawHtml from '../content/module-5.html?raw';
+
+const base = import.meta.env.BASE_URL;
+const html = rawHtml.replace(/href="\//g, `href="${base}`);
 ---
 
 <CourseLayout title="The Query Optimizer (Capstone)" activeSlug="module-5" moduleBadge="Module 5 of 5">

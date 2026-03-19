@@ -1,6 +1,9 @@
 ---
 import CourseLayout from '../layouts/CourseLayout.astro';
-import html from '../content/module-4.html?raw';
+import rawHtml from '../content/module-4.html?raw';
+
+const base = import.meta.env.BASE_URL;
+const html = rawHtml.replace(/href="\//g, `href="${base}`);
 ---
 
 <CourseLayout title="Advanced Algorithms — Hashing, Grouping & Joins" activeSlug="module-4" moduleBadge="Module 4 of 5">

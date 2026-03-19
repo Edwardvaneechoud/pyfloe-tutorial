@@ -6,6 +6,7 @@ interface Props {
 }
 
 const { title, activeSlug, moduleBadge } = Astro.props;
+const base = import.meta.env.BASE_URL;
 
 const modules = [
   { slug: 'introduction', num: '0', title: 'Introduction: Meet pyfloe', short: 'Introduction' },
@@ -36,13 +37,13 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{title} — Build Your Own DataFrame</title>
-  <link rel="stylesheet" href="/global.css">
+  <link rel="stylesheet" href={`${base}global.css`}>
 </head>
 <body>
   <div class="reading-progress" id="reading-progress"></div>
   <div class="page-layout">
     <aside class="sidebar" id="sidebar">
-      <a class="sidebar-brand" href="/">
+      <a class="sidebar-brand" href={base}>
         <span class="sidebar-brand-icon">&#9671;</span>
         Build Your Own DataFrame
       </a>
@@ -62,7 +63,7 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
         <div class="sidebar-section-label">Modules</div>
         {modules.map(m => (
           <a
-            href={`/${m.slug}/`}
+            href={`${base}${m.slug}/`}
             class:list={['sidebar-link', { active: activeSlug === m.slug }]}
           >
             <span class="sidebar-link-num">{m.num}</span>
@@ -73,7 +74,7 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
         <div class="sidebar-section-label" style="margin-top: 14px;">Extras</div>
         {extras.map(e => (
           <a
-            href={`/${e.slug}/`}
+            href={`${base}${e.slug}/`}
             class:list={['sidebar-link', { active: activeSlug === e.slug }]}
           >
             <span class="sidebar-link-num">+</span>
@@ -101,10 +102,10 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
 
         <div class="page-nav">
           {prevPage ? (
-            <a href={`/${prevPage.slug}/`} class="page-nav-prev">&larr; {prevPage.short || prevPage.title}</a>
+            <a href={`${base}${prevPage.slug}/`} class="page-nav-prev">&larr; {prevPage.short || prevPage.title}</a>
           ) : <span />}
           {nextPage ? (
-            <a href={`/${nextPage.slug}/`} class="page-nav-next">{nextPage.short || nextPage.title} &rarr;</a>
+            <a href={`${base}${nextPage.slug}/`} class="page-nav-next">{nextPage.short || nextPage.title} &rarr;</a>
           ) : <span />}
         </div>
         <footer class="site-footer">Created by Edward van Eechoud</footer>
@@ -549,7 +550,7 @@ sys.stderr = _stderr_capture
         if (index || indexLoading) return;
         indexLoading = true;
         try {
-          const res = await fetch('/search-index.json');
+          const res = await fetch(import.meta.env.BASE_URL + 'search-index.json');
           index = await res.json();
         } catch (e) {
           indexLoading = false;
@@ -621,7 +622,7 @@ sys.stderr = _stderr_capture
             html += '<div class="search-page-title">' + r.pageTitle + '</div>';
             lastSlug = r.slug;
           }
-          html += '<a class="search-result" href="/' + r.slug + '/">' +
+          html += '<a class="search-result" href="' + import.meta.env.BASE_URL + r.slug + '/">' +
             '<div class="search-result-heading">' + highlight(r.heading, terms) + '</div>' +
             '<div class="search-result-snippet">' + r.snippet + '</div>' +
             '</a>';

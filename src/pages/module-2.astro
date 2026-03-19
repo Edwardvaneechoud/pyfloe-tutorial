@@ -1,6 +1,9 @@
 ---
 import CourseLayout from '../layouts/CourseLayout.astro';
-import html from '../content/module-2.html?raw';
+import rawHtml from '../content/module-2.html?raw';
+
+const base = import.meta.env.BASE_URL;
+const html = rawHtml.replace(/href="\//g, `href="${base}`);
 ---
 
 <CourseLayout title="Python Magic — Dunder Methods & the Expression AST" activeSlug="module-2" moduleBadge="Module 2 of 5">

@@ -1,6 +1,9 @@
 ---
 import CourseLayout from '../layouts/CourseLayout.astro';
-import html from '../content/module-1.html?raw';
+import rawHtml from '../content/module-1.html?raw';
+
+const base = import.meta.env.BASE_URL;
+const html = rawHtml.replace(/href="\//g, `href="${base}`);
 ---
 
 <CourseLayout title="The Context & Foundation" activeSlug="module-1" moduleBadge="Module 1 of 5">

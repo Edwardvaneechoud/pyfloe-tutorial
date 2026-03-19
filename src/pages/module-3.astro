@@ -1,6 +1,9 @@
 ---
 import CourseLayout from '../layouts/CourseLayout.astro';
-import html from '../content/module-3.html?raw';
+import rawHtml from '../content/module-3.html?raw';
+
+const base = import.meta.env.BASE_URL;
+const html = rawHtml.replace(/href="\//g, `href="${base}`);
 ---
 
 <CourseLayout title="The Engine Room — Plan Nodes & Batched Execution" activeSlug="module-3" moduleBadge="Module 3 of 5">
