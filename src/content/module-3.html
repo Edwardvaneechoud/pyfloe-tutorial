@@ -62,11 +62,8 @@ which rows to yield:
                 <span class="kw">yield</span> <span class="va">row</span></code></pre>
 
 <p>
-This works. But as we established at the end of Module 1 and proved
-throughout Module 2, the lambda is a <strong>black box</strong>. We
-can't ask it "which columns do you need?" or "can I push you below
-this join?" Now we have something better — an <code>Expr</code>
-object that can answer both questions. Let's plug it in.
+The predicate is now an <code>Expr</code> — the inspectable tree from
+Module 2, replacing the lambda. Let's plug it in.
 </p>
 
 <h3>Step 1: Replace the lambda with an Expr</h3>
@@ -144,38 +141,23 @@ rewrites the plan tree. The black box is gone.
 
 <div class="aside callout-orange">
   <div class="aside-title">The two trees meet</div>
-  This is the moment the <strong>expression tree</strong> from Module 2
-  plugs into the <strong>plan tree</strong> from Module 1. The
-  <code>FilterNode</code> is a plan node — it describes data flow. The
-  <code>predicate</code> is an expression — it describes computation.
-  From here on, expressions always live <em>inside</em> plan nodes.
+  The expression tree from Module 2 now plugs into the plan tree from
+  Module 1. From here on, expressions always live <em>inside</em> plan nodes.
 </div>
 
-<pre data-executable data-label="Plan nodes — pyfloe internals"><code>import pyfloe as pf
-from pyfloe.plan import ScanNode, FilterNode, ProjectNode
+<div class="aside callout-orange">
+  <div class="aside-title">Try it</div>
+  What happens if you write <code>col("nonexistent_column")</code> in a filter
+  and call <code>.collect()</code>? Trace the error: <code>compile()</code>
+  looks up the name in <code>col_map</code>, the key doesn't exist, you get a
+  <code>KeyError</code>. In production pyfloe, this is caught earlier by
+  schema validation.
+</div>
 
-# These are pyfloe's REAL plan nodes — the same ones
-# that run when you call .filter() or .select().
-
-data = [("Alice", 30, 80000), ("Bob", 25, 55000), ("Carol", 35, 95000)]
-
-# Step 1: ScanNode wraps raw data + column names
-scan = ScanNode(data, ["name", "age", "salary"])
-
-# Step 2: FilterNode takes a child node + an expression
-filtered = FilterNode(scan, pf.col("age") > 28)
-
-# Step 3: ProjectNode selects columns
-projected = ProjectNode(filtered, ["name", "salary"])
-
-# See the plan tree — same output as LazyFrame.explain()
-print(projected.explain())
-print()
-
-# Execute it — data flows bottom-up through the nodes
-for batch in projected.execute_batched():
-    for row in batch:
-        print(row)</code></pre>
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  The <code>compile()</code> optimization is a performance technique, not an architectural requirement. Safe to skip on a first pass.
+</div>
 
 <h3>Step 2: The col_map problem</h3>
 
@@ -786,6 +768,11 @@ Each method call adds one node on top. The tree grows downward.
 pulls data up through the entire chain.
 </p>
 
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  <code>_from_plan</code> is an implementation detail of how LazyFrame constructs itself internally. Safe to skip.
+</div>
+
 <h3>The <code>_from_plan</code> classmethod</h3>
 
 <p>
@@ -1140,6 +1127,11 @@ than 20 — so it's effectively instant.
   scanning a single row.
 </div>
 
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  Schema inference is useful but not on the critical path to Module 5. Safe to skip.
+</div>
+
 <h3>Inferring schema from data</h3>
 
 <p>
@@ -1329,6 +1321,14 @@ dictionaries — but the logic is essentially the same.
   </div>
 </div>
 
+<div class="aside callout-teal">
+  <div class="aside-title">Thinking question</div>
+  If you have <code>ScanNode &rarr; FilterNode &rarr; LimitNode(5)</code>,
+  and the filter's selectivity is 10%, roughly how many rows does ScanNode
+  yield before LimitNode stops pulling? (Answer: ~50, because on average you
+  need to scan 50 rows to find 5 that pass a 10% filter.)
+</div>
+
 
 <hr class="separator">
 
@@ -1338,43 +1338,46 @@ dictionaries — but the logic is essentially the same.
 <!-- ============================================================ -->
 
 <div class="source-references">
-  <h4>Source References</h4>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <div class="ref-group">
+        <h5>plan.py — Plan Nodes</h5>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" target="_blank" rel="noopener"><code>PlanNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" target="_blank" rel="noopener"><code>WithColumnNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a></li>
+        </ul>
+      </div>
 
-  <div class="ref-group">
-    <h5>plan.py — Plan Nodes</h5>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20PlanNode" target="_blank" rel="noopener"><code>PlanNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20WithColumnNode" target="_blank" rel="noopener"><code>WithColumnNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20IteratorSourceNode" target="_blank" rel="noopener"><code>IteratorSourceNode</code></a></li>
-    </ul>
-  </div>
+      <div class="ref-group">
+        <h5>core.py — LazyFrame API</h5>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener"><code>LazyFrame</code></a></li>
+        </ul>
+      </div>
 
-  <div class="ref-group">
-    <h5>core.py — LazyFrame API</h5>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" target="_blank" rel="noopener"><code>LazyFrame</code></a></li>
-    </ul>
-  </div>
+      <div class="ref-group">
+        <h5>expr.py — Expression AST</h5>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener"><code>BinaryExpr</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" target="_blank" rel="noopener"><code>Col</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" target="_blank" rel="noopener"><code>Lit</code></a></li>
+        </ul>
+      </div>
 
-  <div class="ref-group">
-    <h5>expr.py — Expression AST</h5>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener"><code>BinaryExpr</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" target="_blank" rel="noopener"><code>Col</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" target="_blank" rel="noopener"><code>Lit</code></a></li>
-    </ul>
-  </div>
-
-  <div class="ref-group">
-    <h5>schema.py — Type System</h5>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" target="_blank" rel="noopener"><code>LazySchema</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20ColumnSchema" target="_blank" rel="noopener"><code>ColumnSchema</code></a></li>
-    </ul>
-  </div>
+      <div class="ref-group">
+        <h5>schema.py — Type System</h5>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" target="_blank" rel="noopener"><code>LazySchema</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20ColumnSchema" target="_blank" rel="noopener"><code>ColumnSchema</code></a></li>
+        </ul>
+      </div>
+    </div>
+  </details>
 </div>
 
 <script>

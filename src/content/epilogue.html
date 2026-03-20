@@ -135,63 +135,13 @@ they sit on top of.
     is orders of magnitude more sophisticated.
   </p>
   <p class="hint">
-    <em>Starting point: add a <code>row_count</code> property to
-    <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a>. Now the optimizer knows the input size. For
-    a join, if one side has 100 rows and the other has 10 million, which
-    should be the build side? That's your first cost-based rule.</em>
+    <em>Starting point: add a <code>row_count()</code> method to each plan
+    node and teach the optimizer to pick the smaller side as the hash-table
+    build side.
+    <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a>
+    knows its size; <code>FilterNode</code> can estimate output rows from a
+    selectivity factor. That's your first cost-based rule.</em>
   </p>
-
-  <p style="margin-top: 16px; font-family: var(--sans); font-size: 14.5px;">
-    Here's a skeleton to get you started — add <code>row_count</code> to
-    the nodes and make the optimizer pick a build side:
-  </p>
-
-<pre data-executable data-label="Explore: cost-based join ordering"><code>class PlanNode:
-    def row_count(self):
-        """Estimate output rows. Override in subclasses."""
-        return None
-
-class ScanNode(PlanNode):
-    def __init__(self, name, rows):
-        self.name = name
-        self._rows = rows
-    def row_count(self):
-        return len(self._rows)
-
-class FilterNode(PlanNode):
-    def __init__(self, child, selectivity=0.1):
-        self.child = child
-        self.selectivity = selectivity
-    def row_count(self):
-        child_count = self.child.row_count()
-        if child_count is not None:
-            return int(child_count * self.selectivity)
-        return None
-
-class JoinNode(PlanNode):
-    def __init__(self, left, right):
-        self.left = left
-        self.right = right
-
-def pick_build_side(join):
-    """The smaller side should be the build (hash table) side."""
-    left_count = join.left.row_count()
-    right_count = join.right.row_count()
-    if left_count is not None and right_count is not None:
-        if right_count < left_count:
-            return "right", right_count
-        return "left", left_count
-    return "unknown", None
-
-# A big table filtered down, joined to a small lookup table
-big = FilterNode(ScanNode("orders", range(10_000_000)), selectivity=0.01)
-small = ScanNode("regions", range(50))
-join = JoinNode(big, small)
-
-side, count = pick_build_side(join)
-print(f"Left  (orders filtered): ~{big.row_count():,} rows")
-print(f"Right (regions):          {small.row_count()} rows")
-print(f"Build side: {side} ({count:,} rows) — much cheaper to hash")</code></pre>
 </div>
 
 <div class="open-question">
@@ -316,8 +266,10 @@ Go build something.
 </p>
 
 <div class="source-references">
-  <h2>Source References</h2>
-  <div class="source-ref-group">
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <div class="source-ref-group">
     <h4>plan.py &mdash; Plan Nodes</h4>
     <ul class="source-ref-list">
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
@@ -338,7 +290,9 @@ Go build something.
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener">BinaryExpr</a></li>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" target="_blank" rel="noopener">required_columns()</a></li>
     </ul>
-  </div>
+      </div>
+    </div>
+  </details>
 </div>
 
 <!-- ============================================================ -->

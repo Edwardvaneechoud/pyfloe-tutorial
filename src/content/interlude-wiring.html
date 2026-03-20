@@ -446,9 +446,7 @@ transformation is called <strong class="highlight">column pruning</strong>.
   Both filter pushdown and column pruning share the same core idea:
   <em>do less work by doing it earlier</em>. Filters reduce rows; pruning
   reduces columns. Both push their logic as close to the data source as
-  possible. And both require the ability to <em>inspect</em> the plan
-  tree — which is exactly why we built expressions as data (Module 2)
-  rather than opaque lambdas.
+  possible.
 </div>
 
 
@@ -514,24 +512,24 @@ tree and <code>.schema</code> to inspect types without running anything.
 The differences are under the hood:
 </p>
 
-<div class="comparison-grid">
-  <div class="comparison-card">
-    <h4>What pyfloe does</h4>
-    <p>
-      Pure Python. Row-at-a-time tuples (in batches of 1,024).
-      <code>dict</code>-based hash tables. Rule-based optimizer with
-      two passes. Zero dependencies. ~6,000 lines.
-    </p>
-  </div>
-  <div class="comparison-card">
-    <h4>What Polars adds</h4>
-    <p>
-      Rust core via PyO3. Columnar Arrow arrays. SIMD vectorization.
-      Work-stealing parallelism (rayon). Cost-based optimizer.
-      Streaming engine for out-of-core data.
-    </p>
-  </div>
-</div>
+<table class="comparison-table" style="width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 20px 0;">
+  <thead>
+    <tr>
+      <th style="text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border);">Dimension</th>
+      <th style="text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border);">pyfloe</th>
+      <th style="text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--border);">Polars</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Language</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Pure Python</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Rust core via PyO3</td></tr>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Row format</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Tuples (row-oriented, in batches of 1,024)</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Arrow arrays (columnar)</td></tr>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Hash tables</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Python <code>dict</code> / <code>defaultdict</code></td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Custom hash maps with SIMD probing</td></tr>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Optimizer</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Rule-based, 2 passes</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Cost-based + rule-based</td></tr>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Parallelism</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Single-threaded</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Work-stealing (rayon)</td></tr>
+    <tr><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Scale</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">In-memory only</td><td style="padding: 8px 12px; border-bottom: 1px solid var(--border);">Streaming engine for out-of-core</td></tr>
+    <tr><td style="padding: 8px 12px;">Dependencies</td><td style="padding: 8px 12px;">Zero (~6K lines)</td><td style="padding: 8px 12px;">Polars + Arrow ecosystem</td></tr>
+  </tbody>
+</table>
 
 <p>
 The architecture is the same: a plan tree of nodes, an expression AST
@@ -750,10 +748,11 @@ plan trees — the skill you'll need most in Module 5.
 </div>
 
 <div class="source-references">
-  <h4>Source References</h4>
-
-  <div class="ref-group">
-    <h5>plan.py — Plan Nodes</h5>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <div class="ref-group">
+        <h5>plan.py — Plan Nodes</h5>
     <ul>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
@@ -784,7 +783,9 @@ plan trees — the skill you'll need most in Module 5.
     <ul>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/schema.py#:~:text=class%20LazySchema" target="_blank" rel="noopener"><code>LazySchema</code></a></li>
     </ul>
-  </div>
+      </div>
+    </div>
+  </details>
 </div>
 
 <script>

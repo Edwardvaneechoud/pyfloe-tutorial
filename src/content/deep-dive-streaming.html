@@ -57,7 +57,7 @@ than the buzzwords suggest.
   <a class="toc-item" href="#lesson-1"><span class="toc-num">D.1</span> The Iterator Factory Pattern</a>
   <a class="toc-item" href="#lesson-2"><span class="toc-num">D.2</span> Constant-Memory File Reading</a>
   <a class="toc-item" href="#lesson-3"><span class="toc-num">D.3</span> Constant-Memory Writing</a>
-  <a class="toc-item" href="#lesson-4"><span class="toc-num">D.4</span> The Stream Pipeline — Skipping the Tree</a>
+  <a class="toc-item" href="#lesson-4"><span class="toc-num">D.4</span> The Stream Pipeline — What You Give Up When You Skip the Tree</a>
   <a class="toc-item" href="#exercises"><span class="toc-num">&bull;</span> Exercises</a>
 </nav>
 
@@ -246,15 +246,6 @@ same <code>execute()</code> / <code>execute_batched()</code> contract. The rest
 of the plan tree can't tell the difference.
 </p>
 
-<div class="aside callout-teal">
-  <div class="aside-title">How Polars does this</div>
-  This is why <code>read_csv("big.csv").to_pylist()</code> works twice in a
-  row. Polars does the same thing — <code>scan_csv()</code> creates a plan node
-  with a factory that reopens the file on each evaluation. The word "scan"
-  literally means "I'll read it when you ask me to." Your plan tree doesn't
-  hold data. It holds a <em>promise</em> of data.
-</div>
-
 <hr class="separator">
 
 
@@ -275,29 +266,12 @@ we encounter the one genuinely tricky problem in the whole streaming story:
 <strong>type inference</strong>.
 </p>
 
-<h3>The eager alternative (and why it doesn't work)</h3>
-
-<p>
-Pandas reads the entire file into memory:
-</p>
-
-<div class="code-label"><span class="dot dot-naive"></span> Pandas-style: load everything</div>
-<pre><code><span class="kw">import</span> <span class="va">pandas</span> <span class="kw">as</span> <span class="va">pd</span>
-<span class="va">df</span> <span class="op">=</span> <span class="va">pd</span>.<span class="fn">read_csv</span>(<span class="st">"errors.csv"</span>)  <span class="cm"># 10 GB file → 10 GB in RAM</span></code></pre>
-
-<p>
-For a 10 GB CSV on a machine with 8 GB of RAM, this crashes. Pandas needs to
-see every row to infer types, build the DataFrame, and construct its NumPy
-arrays. The entire file must fit in memory.
-</p>
-
-<p>
-We want something different. We want to <em>sample</em> a few rows to figure
-out types, then yield the rest one row at a time, never holding more than a
-single row in memory.
-</p>
-
 <h3>Two-phase reading: sample, then stream</h3>
+
+<p>
+We want to sample a few rows to figure out types, then yield the rest one
+row at a time, never holding more than a single row in memory.
+</p>
 
 <p>
 pyfloe's CSV reader does its work in two phases. Phase one happens at
@@ -463,37 +437,10 @@ invisible to the filter, join, and project nodes above it.
 </h2>
 
 <p>
-Reading was the hard part (type inference, factory closures, file reopening).
-Writing is almost trivially simple — and that's the point. Once you have a
-streaming plan tree, writing to disk is just… consuming the iterator into a
-file instead of a list.
-</p>
-
-<h3>The naive approach: materialize, then write</h3>
-
-<div class="code-label"><span class="dot dot-naive"></span> Collect, then write — defeats the purpose</div>
-<pre><code><span class="cm"># This loads the ENTIRE result into RAM</span>
-<span class="va">result</span> <span class="op">=</span> <span class="va">pipeline</span>.<span class="fn">collect</span>().<span class="fn">to_pylist</span>()
-
-<span class="kw">with</span> <span class="bi">open</span>(<span class="st">"output.csv"</span>, <span class="st">"w"</span>) <span class="kw">as</span> <span class="va">f</span>:
-    <span class="va">writer</span> <span class="op">=</span> <span class="va">csv</span>.<span class="fn">writer</span>(<span class="va">f</span>)
-    <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">pipeline</span>.<span class="va">columns</span>)
-    <span class="kw">for</span> <span class="va">row</span> <span class="kw">in</span> <span class="va">result</span>:
-        <span class="va">writer</span>.<span class="fn">writerow</span>(<span class="va">row</span>.<span class="fn">values</span>())</code></pre>
-
-<div class="aside callout-red">
-  <div class="aside-title">The problem</div>
-  This materializes every row into a Python list before writing any of them. If
-  your pipeline produces 50 million rows, all 50 million sit in memory at once.
-  You built a lazy engine, but calling <code>.collect()</code> before writing
-  throws all that laziness away.
-</div>
-
-<h3>The streaming approach: write from the plan</h3>
-
-<p>
-The fix is obvious once you see it. Don't collect. Don't materialize. Just
-iterate the plan directly and write each batch as it arrives:
+Reading was the hard part. Writing is almost trivially simple — once you have a
+streaming plan tree, writing to disk is just consuming the iterator into a
+file instead of a list. Don't collect. Don't materialize. Just iterate the
+plan directly and write each batch as it arrives:
 </p>
 
 <div class="code-label"><span class="dot dot-better"></span> Stream from the plan to the file</div>
@@ -630,7 +577,7 @@ function calcMemory(label, sizeMB) {
 
 <h2 id="lesson-4">
   <span class="lesson-num">Section D.4</span>
-  The Stream Pipeline — Skipping the Tree
+  The Stream Pipeline — What You Give Up When You Skip the Tree
 </h2>
 
 <p>
@@ -639,6 +586,14 @@ Modules 3–5. <code>from_iter()</code> returns a <a href="https://github.com/Ed
 by <code>IteratorSourceNode</code> → <code>FilterNode</code> →
 <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a> → etc. The volcano model pulls rows through the tree.
 It works, it's elegant, and it streams with constant memory.
+</p>
+
+<p>
+pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a>
+class offers a faster alternative for simple pipelines — but it sacrifices
+everything you built in this course: no joins, no aggregation, no schema
+propagation, no optimizer. The things you built are exactly what Stream
+trades away for speed.
 </p>
 
 <p>
@@ -853,16 +808,6 @@ pattern from Module 4 — running sum, running count, running max — just done
 manually because <code>Stream</code> doesn't have <code>group_by</code>. But
 the student should recognize it: it's the same algorithm, different container.
 </p>
-
-<div class="aside callout-teal">
-  <div class="aside-title">The production version</div>
-  Spark calls this concept "whole-stage code generation" — instead of
-  interpreting the plan tree node by node, it compiles the plan into a single
-  tight loop (in JVM bytecode). Flink's operator chaining does the same.
-  pyfloe's <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> uses a Python list of tuples instead of bytecode,
-  but the insight is identical: <strong>when per-row work is tiny, the overhead
-  of indirection matters more than the work itself.</strong>
-</div>
 
 <h3>When to use which</h3>
 
@@ -1080,10 +1025,12 @@ is what you've already built.
 </p>
 
 <div class="source-references">
-  <h3>Source References</h3>
-  <p>Browse the pyfloe source code for the classes and functions covered in this deep dive.</p>
-  <div class="ref-group">
-    <h4>plan.py — Plan Nodes</h4>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <p>Browse the pyfloe source code for the classes and functions covered in this deep dive.</p>
+      <div class="ref-group">
+        <h4>plan.py — Plan Nodes</h4>
     <ul>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
@@ -1111,5 +1058,7 @@ is what you've already built.
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_jsonl" target="_blank" rel="noopener"><code>read_jsonl()</code></a></li>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_parquet" target="_blank" rel="noopener"><code>read_parquet()</code></a></li>
     </ul>
-  </div>
+      </div>
+    </div>
+  </details>
 </div>

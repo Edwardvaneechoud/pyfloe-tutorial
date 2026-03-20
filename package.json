@@ -7,6 +7,18 @@
     "preview": "astro preview"
   },
   "dependencies": {
-    "astro": "^5.7.10"
+    "@codemirror/autocomplete": "^6.20.1",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.2",
+    "@codemirror/search": "^6.6.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.40.0",
+    "astro": "^5.7.10",
+    "codemirror": "^6.0.2"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.8",
+    "typescript": "^5.9.3"
   }
 }

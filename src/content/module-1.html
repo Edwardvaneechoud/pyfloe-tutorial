@@ -26,6 +26,15 @@ But first, we need to talk about why DataFrames exist in the first place.
   <a class="toc-item" href="#lesson-4"><span class="toc-num">1.4</span> The Problem with Lambdas</a>
 </nav>
 
+<p class="subtitle" style="font-style: italic; margin-top: 16px;">
+If you've used Polars or PySpark, you've already used a lazy engine — you
+just haven't seen inside one. This module covers the Python primitives that
+make laziness work: generators and the <code>yield</code> keyword. If you're
+already comfortable with generators, skim Lessons 1.2–1.3 and jump to
+<a href="#lesson-4">Lesson 1.4 (The Problem with Lambdas)</a>, which sets up
+the rest of the course.
+</p>
+
 <!-- ============================================================ -->
 <!-- LESSON 1.1 -->
 <!-- ============================================================ -->
@@ -85,6 +94,11 @@ The DataFrame is the bridge. It gives you the <span class="highlight">intuitive,
 tabular mental model of Excel</span>, wrapped in the programmatic power
 and automation capabilities of Python.
 </p>
+
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  This history section is interesting context but not required for the technical arc. Safe to skip on a first pass.
+</div>
 
 <h3>A brief history</h3>
 
@@ -805,23 +819,36 @@ lazy pipeline that transforms and filters with zero intermediate lists.
 </p>
 </div>
 
+<div class="aside callout-teal">
+  <div class="aside-title">Thinking question</div>
+  You chain <code>ScanNode &rarr; FilterNode &rarr; MapNode</code> and call
+  <code>.first()</code>. The ScanNode has 1 million rows, but only the 500th
+  row passes the filter. How many rows does the ScanNode yield? How many does
+  the MapNode process? (Answer: 500 and 1, respectively. The generator chain
+  stops pulling after the first match reaches the top.)
+</div>
+
 <div class="source-references">
-  <h2>Source References</h2>
-  <div class="source-ref-group">
-    <h4>plan.py &mdash; Plan Nodes</h4>
-    <ul class="source-ref-list">
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" target="_blank" rel="noopener">SortNode</a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener">JoinNode</a></li>
-    </ul>
-  </div>
-  <div class="source-ref-group">
-    <h4>core.py &mdash; LazyFrame API</h4>
-    <ul class="source-ref-list">
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20collect" target="_blank" rel="noopener">collect()</a></li>
-    </ul>
-  </div>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <div class="source-ref-group">
+        <h4>plan.py &mdash; Plan Nodes</h4>
+        <ul class="source-ref-list">
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener">ScanNode</a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortNode" target="_blank" rel="noopener">SortNode</a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener">JoinNode</a></li>
+        </ul>
+      </div>
+      <div class="source-ref-group">
+        <h4>core.py &mdash; LazyFrame API</h4>
+        <ul class="source-ref-list">
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=def%20collect" target="_blank" rel="noopener">collect()</a></li>
+        </ul>
+      </div>
+    </div>
+  </details>
 </div>
 
 <hr class="separator">

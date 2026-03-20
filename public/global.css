@@ -524,6 +524,16 @@ pre code {
 .callout-red { background: var(--red-bg); border-left-color: var(--red); }
 .callout-red .aside-title { color: var(--red); }
 
+.callout-deepcut {
+  background: #F5F4F0;
+  border-left: 3px dashed #9E9E9E;
+  border-radius: 0 8px 8px 0;
+}
+.callout-deepcut .aside-title {
+  color: #757575;
+  font-style: italic;
+}
+
 /* Side quest callout */
 .side-quest-callout {
   border: 2px dashed var(--teal);
@@ -1995,7 +2005,6 @@ h2[id] {
 .runner-block {
   margin: 14px 0 20px;
   border-radius: 8px;
-  overflow: hidden;
   border: 1px solid rgba(255,255,255,0.08);
   transition: box-shadow 0.2s;
 }
@@ -2074,6 +2083,7 @@ h2[id] {
   background: #181825;
   padding: 8px 16px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
+  border-radius: 8px 8px 0 0;
   user-select: none;
 }
 
@@ -2130,66 +2140,23 @@ h2[id] {
 }
 
 .runner-editor {
-  background: var(--bg-code);
+  background: #1E1E2E;
   padding: 0;
   position: relative;
 }
 
-.runner-highlight,
-.runner-editor textarea {
-  width: 100%;
-  min-height: 100px;
-  font-family: var(--mono);
-  font-size: 14px;
-  line-height: 1.6;
-  padding: 16px 20px;
-  margin: 0;
-  border: none;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  tab-size: 4;
-  -moz-tab-size: 4;
-  overflow-wrap: break-word;
+.runner-editor .cm-editor {
+  min-height: 80px;
+  max-height: 500px;
 }
 
-.runner-highlight {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  pointer-events: none;
-  background: transparent;
-  color: #CDD6F4;
-  overflow: hidden;
-  border-radius: 0;
-}
-
-.runner-editor textarea {
-  position: relative;
-  z-index: 1;
-  background: transparent;
-  color: transparent;
-  caret-color: #CDD6F4;
+.runner-editor .cm-editor.cm-focused {
   outline: none;
-  resize: none;
-  -webkit-text-fill-color: transparent;
 }
 
-.runner-editor textarea::placeholder {
-  color: rgba(255,255,255,0.2);
-  -webkit-text-fill-color: rgba(255,255,255,0.2);
+.runner-editor .cm-scroller {
+  overflow: auto;
 }
-
-/* Python syntax highlighting colors (Catppuccin Mocha) */
-.hl-keyword  { color: #CBA6F7; }  /* purple — keywords */
-.hl-builtin  { color: #F9E2AF; }  /* yellow — builtins */
-.hl-func     { color: #89B4FA; }  /* blue — function calls */
-.hl-string   { color: #A6E3A1; }  /* green — strings */
-.hl-comment  { color: #6C7086; font-style: italic; }  /* gray — comments */
-.hl-number   { color: #FAB387; }  /* peach — numbers */
-.hl-operator { color: #89DCEB; }  /* teal — operators */
-.hl-paren    { color: #BAC2DE; }  /* subtext — brackets */
-.hl-punct    { color: #A6ADC8; }  /* overlay — punctuation */
 
 .runner-toolbar {
   display: flex;
@@ -2198,6 +2165,11 @@ h2[id] {
   background: #181825;
   padding: 8px 16px;
   border-top: 1px solid rgba(255,255,255,0.06);
+  border-radius: 0 0 8px 8px;
+}
+
+.runner-toolbar:has(~ .runner-output.visible) {
+  border-radius: 0;
 }
 
 .runner-btn {
@@ -2255,6 +2227,7 @@ h2[id] {
   max-height: 300px;
   overflow-y: auto;
   display: none;
+  border-radius: 0 0 8px 8px;
 }
 
 .runner-output.visible {
@@ -2368,6 +2341,36 @@ a.source-link:hover::after {
   margin-top: 48px;
   padding-top: 32px;
   border-top: 1px solid var(--border-light);
+}
+
+.source-references summary {
+  font-family: var(--sans);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-references summary::-webkit-details-marker {
+  display: none;
+}
+
+.source-references summary::before {
+  content: '▶';
+  font-size: 12px;
+  transition: transform 0.2s;
+}
+
+.source-references details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.source-references details .source-ref-content {
+  margin-top: 16px;
 }
 
 .source-references h2 {

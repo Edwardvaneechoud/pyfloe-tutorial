@@ -484,13 +484,10 @@ the optimizer would have no way to know which columns a filter touches.
 </p>
 
 <div class="aside callout-orange">
-  <div class="aside-title">This is why lambdas had to die</div>
-  Remember Module 1, Lesson 1.4? We showed that lambda-based filters
-  are opaque — <code>lambda row: row["region"] == "EU"</code> gives the
-  optimizer no way to inspect which columns it accesses. That's why we
-  built the entire expression AST. This moment — filter pushdown — is
-  the payoff. The expression is <em>data</em>, so the optimizer can
-  call <code>.required_columns()</code> and make intelligent decisions.
+  <div class="aside-title">This is the moment required_columns() earns its keep</div>
+  Without it — if the filter were still a lambda — the optimizer would
+  have no way to inspect which columns the filter accesses. None of what
+  follows would be possible.
 </div>
 
 <h3>The pushdown logic: <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=def%20_try_push_filter" class="source-link" target="_blank" rel="noopener"><code>_try_push_filter</code></a></h3>
@@ -1242,8 +1239,10 @@ it takes.
 <!-- ============================================================ -->
 
 <div class="source-references">
-  <h2>Source References</h2>
-  <div class="source-ref-group">
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <div class="source-ref-group">
     <h4>plan.py &mdash; Plan Nodes &amp; Optimizer</h4>
     <ul class="source-ref-list">
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener">FilterNode</a></li>
@@ -1276,7 +1275,9 @@ it takes.
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" target="_blank" rel="noopener">BinaryExpr</a></li>
       <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" target="_blank" rel="noopener">required_columns()</a></li>
     </ul>
-  </div>
+      </div>
+    </div>
+  </details>
 </div>
 
 <div class="aside callout-purple">

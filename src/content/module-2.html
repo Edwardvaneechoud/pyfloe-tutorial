@@ -30,6 +30,13 @@ features: <strong>Dunder Methods</strong>.
   <a class="toc-item" href="#lesson-4"><span class="toc-num">2.4</span> The Payoff — Inspectable Expressions</a>
 </nav>
 
+<p class="subtitle" style="font-style: italic; margin-top: 16px;">
+If you already know how <code>__add__</code> and <code>__gt__</code> work,
+skim to <a href="#lesson-2">Lesson 2.2</a> where we use them to build the
+expression AST. The key insight isn't the dunder methods themselves — it's
+what we do with them.
+</p>
+
 <!-- ============================================================ -->
 <!-- LESSON 2.1 -->
 <!-- ============================================================ -->
@@ -143,16 +150,10 @@ care about parentheses, whitespace, or the fact that you typed
 only the essential meaning.
 </p>
 
-<div class="aside callout-orange">
-  <div class="aside-title">Two trees in this course — don't confuse them</div>
-  In Module 1, we built a chain of <strong>plan nodes</strong>
-  (ScanNode → FilterNode → collect). That's a tree too — it
-  describes <em>how data flows</em> through the engine. The
-  <strong>expression AST</strong> we're building now is a different tree:
-  it describes <em>what to compute</em> on each row. Expressions live
-  <em>inside</em> plan nodes — a <code>FilterNode</code> holds an
-  expression that it evaluates per row. Two trees, different jobs.
-</div>
+<p>
+This is the expression tree — the second of the two trees introduced in
+the Introduction. It lives inside plan nodes.
+</p>
 
 <p>
 Our goal for the rest of this module: make it so that writing
@@ -518,6 +519,11 @@ mechanical — each one is a one-liner that builds a new
 </div>
 </details>
 
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  Reverse operators and the <code>__bool__</code> trap are completeness details. They're useful if you encounter these edge cases, but not needed for Module 5.
+</div>
+
 <h3>Edge case: reverse operators</h3>
 
 <p>
@@ -586,6 +592,14 @@ pyfloe prevents this with a guardrail:
   <code>__bool__</code> guard. You used <code>and</code> (which calls
   <code>__bool__</code>) instead of <code>&amp;</code> (which calls
   <code>__and__</code>). Same mechanism, same fix.
+</div>
+
+<div class="aside callout-orange">
+  <div class="aside-title">Try it</div>
+  Run <code>col("age") > 28 and col("region") == "EU"</code> in the code
+  editor. Read the error message. Now replace <code>and</code> with
+  <code>&amp;</code>. This is the single most common mistake Polars users
+  make — and now you know exactly why it happens.
 </div>
 
 <h3>Free bonus: operator precedence</h3>
@@ -1364,18 +1378,30 @@ and other unary operations.
 </p>
 </div>
 
+<div class="aside callout-teal">
+  <div class="aside-title">Thinking question</div>
+  What does <code>(-col("price")).required_columns()</code> return? What about
+  <code>(col("a") + col("b")) > (col("c") * col("d"))</code>? Trace the
+  recursive <code>required_columns()</code> calls. (Answer:
+  <code>{"price"}</code> and <code>{"a", "b", "c", "d"}</code>.)
+</div>
+
 <hr class="separator">
 
 <div class="source-references">
-  <h3>Source References</h3>
-  <h4>expr.py — Expression AST</h4>
-  <ul>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Expr" class="source-link" target="_blank" rel="noopener"><code>Expr</code></a> — base class for all expressions</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a> — returns the set of columns an expression needs</li>
-  </ul>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <h4>expr.py — Expression AST</h4>
+      <ul>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Expr" class="source-link" target="_blank" rel="noopener"><code>Expr</code></a> — base class for all expressions</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20required_columns" class="source-link" target="_blank" rel="noopener"><code>required_columns()</code></a> — returns the set of columns an expression needs</li>
+      </ul>
+    </div>
+  </details>
 </div>
 
 <hr class="separator">

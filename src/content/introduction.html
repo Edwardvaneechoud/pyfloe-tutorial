@@ -518,30 +518,34 @@ how something works, you will too.
 <hr class="separator">
 
 <div class="source-references">
-  <h3>Source References</h3>
-  <h4>plan.py — Plan Nodes</h4>
-  <ul>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> — filters rows using an expression predicate</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> — reads data from a source</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a> — joins two plan trees together</li>
-  </ul>
-  <h4>core.py — LazyFrame API</h4>
-  <ul>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> — the public API that wraps plan nodes into a fluent interface</li>
-  </ul>
-  <h4>expr.py — Expression AST</h4>
-  <ul>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" class="source-link" target="_blank" rel="noopener"><code>col</code></a> — creates a column reference expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" class="source-link" target="_blank" rel="noopener"><code>lit</code></a> — creates a literal value expression</li>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20when" class="source-link" target="_blank" rel="noopener"><code>when</code></a> — conditional expression builder</li>
-  </ul>
-  <h4>stream.py — Streaming</h4>
-  <ul>
-    <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> — streaming pipeline class</li>
-  </ul>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <h4>plan.py — Plan Nodes</h4>
+      <ul>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> — filters rows using an expression predicate</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> — reads data from a source</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" class="source-link" target="_blank" rel="noopener"><code>JoinNode</code></a> — joins two plan trees together</li>
+      </ul>
+      <h4>core.py — LazyFrame API</h4>
+      <ul>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/core.py#:~:text=class%20LazyFrame" class="source-link" target="_blank" rel="noopener"><code>LazyFrame</code></a> — the public API that wraps plan nodes into a fluent interface</li>
+      </ul>
+      <h4>expr.py — Expression AST</h4>
+      <ul>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20BinaryExpr" class="source-link" target="_blank" rel="noopener"><code>BinaryExpr</code></a> — two operands combined with a binary operator</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Col" class="source-link" target="_blank" rel="noopener"><code>Col</code></a> — column reference expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20Lit" class="source-link" target="_blank" rel="noopener"><code>Lit</code></a> — literal value expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20col" class="source-link" target="_blank" rel="noopener"><code>col</code></a> — creates a column reference expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20lit" class="source-link" target="_blank" rel="noopener"><code>lit</code></a> — creates a literal value expression</li>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=def%20when" class="source-link" target="_blank" rel="noopener"><code>when</code></a> — conditional expression builder</li>
+      </ul>
+      <h4>stream.py — Streaming</h4>
+      <ul>
+        <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/stream.py#:~:text=class%20Stream" class="source-link" target="_blank" rel="noopener"><code>Stream</code></a> — streaming pipeline class</li>
+      </ul>
+    </div>
+  </details>
 </div>
 
 <hr class="separator">

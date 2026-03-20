@@ -198,6 +198,11 @@ print(f"\nInternal plan node: {type(joined._plan).__name__}")</code></pre>
   Where do the <code>None</code> values appear?
 </div>
 
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  <code>_make_key_fn</code> is a performance detail. Safe to skip.
+</div>
+
 <h3>From indices to key functions</h3>
 
 <p>
@@ -786,6 +791,11 @@ algorithm processes every row exactly once, maintaining one integer per group.
 <!-- LESSON 4.4 -->
 <!-- ============================================================ -->
 
+<div class="aside callout-deepcut">
+  <div class="aside-title">Deep Cut</div>
+  Lesson 4.4 covers sorted-stream alternatives that never appear in the optimizer or Module 5. Interesting for understanding algorithmic trade-offs, but safe to skip on a first pass.
+</div>
+
 <h2 id="lesson-4">
   <span class="lesson-num">Lesson 4.4</span>
   The Sorted Alternative — O(1) Memory
@@ -1066,45 +1076,16 @@ parameter:
   </div>
 </details>
 
+<div class="aside callout-purple">
+  <div class="aside-title">Looking ahead</div>
+  The optimizer we'll build in Module 5 doesn't choose between hash and
+  sorted algorithms — it uses hash joins unconditionally. A cost-based
+  optimizer (discussed in the Epilogue) would make this choice dynamically:
+  if it knows the input is already sorted, it could swap
+  <code>JoinNode</code> for <code>SortedMergeJoinNode</code> automatically.
+  That's one of the open problems we'll leave you with.
+</div>
 
-<hr class="separator">
-
-
-<!-- ============================================================ -->
-<!-- TWO TREES REMINDER -->
-<!-- ============================================================ -->
-
-<h3>The two trees — where we stand</h3>
-
-<p>
-Before we wrap up, let's ground what we've built in the architecture.
-Remember the two trees from earlier modules:
-</p>
-
-<p>
-The <strong>Plan Tree</strong> describes how data flows. After this module,
-we have a much richer vocabulary of plan nodes: <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" class="source-link" target="_blank" rel="noopener"><code>ScanNode</code></a> →
-<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" class="source-link" target="_blank" rel="noopener"><code>FilterNode</code></a> → <code>JoinNode</code> → <code>AggNode</code> →
-<a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" class="source-link" target="_blank" rel="noopener"><code>ProjectNode</code></a>. Joins are the first nodes with <em>two</em>
-children (left and right inputs), turning the plan from a simple chain
-into a real tree.
-</p>
-
-<p>
-The <strong>Expression Tree</strong> (from Module 2) lives <em>inside</em>
-plan nodes. The <code>AggNode</code> is the clearest example: each
-aggregation expression (<code>col("amount").sum()</code>) is an expression
-tree node of type <a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20AggExpr" class="source-link" target="_blank" rel="noopener"><code>AggExpr</code></a>. The node's <code>compile()</code>
-method turns it into a fast callable; the <code>agg_name</code> attribute
-selects the right accumulator. Expressions are the <em>what to compute</em>;
-plan nodes are the <em>how to flow data</em>.
-</p>
-
-<p>
-These two trees will fully converge in Module 5, where the Optimizer walks
-the plan tree, inspects the expressions inside each node, and rewrites
-the whole structure for efficiency.
-</p>
 
 <hr class="separator">
 
@@ -1228,33 +1209,46 @@ Test your understanding of the algorithms we've built.
   been heading.
 </div>
 
+<div class="aside callout-teal">
+  <div class="aside-title">Thinking question</div>
+  The hash join builds from the right side. What happens if you accidentally
+  build from the 10-million-row side instead of the 50-row side? The result
+  is the same &mdash; but what changes about memory usage? (Answer: You'd
+  build a hash table with 10M entries instead of 50. Same O(n+m) time, but
+  O(10M) memory instead of O(50).)
+</div>
+
 <div class="source-references">
-  <h3>Source References</h3>
-  <p>Browse the pyfloe source code for the classes and functions covered in this module.</p>
-  <div class="ref-group">
-    <h4>plan.py — Plan Nodes</h4>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener"><code>JoinNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" target="_blank" rel="noopener"><code>AggNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" target="_blank" rel="noopener"><code>SortedAggNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedMergeJoinNode" target="_blank" rel="noopener"><code>SortedMergeJoinNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
-    </ul>
-  </div>
-  <div class="ref-group">
-    <h4>expr.py — Expression AST</h4>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20AggExpr" target="_blank" rel="noopener"><code>AggExpr</code></a></li>
-    </ul>
-  </div>
-  <div class="ref-group">
-    <h4>io.py — File I/O</h4>
-    <ul>
-      <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_csv" target="_blank" rel="noopener"><code>read_csv()</code></a></li>
-    </ul>
-  </div>
+  <details>
+    <summary>Source References</summary>
+    <div class="source-ref-content">
+      <p>Browse the pyfloe source code for the classes and functions covered in this module.</p>
+      <div class="ref-group">
+        <h4>plan.py — Plan Nodes</h4>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20JoinNode" target="_blank" rel="noopener"><code>JoinNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20AggNode" target="_blank" rel="noopener"><code>AggNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedAggNode" target="_blank" rel="noopener"><code>SortedAggNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20SortedMergeJoinNode" target="_blank" rel="noopener"><code>SortedMergeJoinNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ScanNode" target="_blank" rel="noopener"><code>ScanNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20FilterNode" target="_blank" rel="noopener"><code>FilterNode</code></a></li>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/plan.py#:~:text=class%20ProjectNode" target="_blank" rel="noopener"><code>ProjectNode</code></a></li>
+        </ul>
+      </div>
+      <div class="ref-group">
+        <h4>expr.py — Expression AST</h4>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/expr.py#:~:text=class%20AggExpr" target="_blank" rel="noopener"><code>AggExpr</code></a></li>
+        </ul>
+      </div>
+      <div class="ref-group">
+        <h4>io.py — File I/O</h4>
+        <ul>
+          <li><a href="https://github.com/Edwardvaneechoud/pyfloe/blob/main/src/pyfloe/io.py#:~:text=def%20read_csv" target="_blank" rel="noopener"><code>read_csv()</code></a></li>
+        </ul>
+      </div>
+    </div>
+  </details>
 </div>
 
 <script>

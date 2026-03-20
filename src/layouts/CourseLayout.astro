@@ -168,7 +168,7 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
     revealTargets.forEach(el => revealObserver.observe(el));
 
     // Copy button on non-runner code blocks
-    document.querySelectorAll('pre:not([data-executable])').forEach(pre => {
+    document.querySelectorAll<HTMLPreElement>('pre:not([data-executable])').forEach(pre => {
       const btn = document.createElement('button');
       btn.className = 'copy-btn';
       btn.textContent = 'Copy';
@@ -189,36 +189,38 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
     });
 
     // ============================================================
-    // PYODIDE INTERACTIVE RUNNER
+    // PYODIDE INTERACTIVE RUNNER (CodeMirror)
     // ============================================================
 
     const runnableBlocks = document.querySelectorAll('pre[data-executable]');
 
     if (runnableBlocks.length > 0) {
-      // State
-      let pyodideInstance = null;
+      let pyodideInstance: any = null;
       let pyodideReady = false;
       let pyodideLoading = false;
-      const runners = [];
+      const runners: Array<{
+        editor: any;
+        runBtn: HTMLButtonElement;
+        resetBtn: HTMLButtonElement;
+        output: HTMLDivElement;
+        rawCode: string;
+        badge: HTMLElement | null;
+      }> = [];
 
-      // Build runner UI for each executable block
       runnableBlocks.forEach((pre, idx) => {
         const code = pre.querySelector('code');
-        const rawCode = code ? code.textContent : pre.textContent;
+        const rawCode = (code ? code.textContent : pre.textContent || '').trim();
         const label = pre.getAttribute('data-label') || 'Interactive Python';
         const startExpanded = pre.hasAttribute('data-expanded');
 
-        // Remove the preceding code-label div if present
         const prevEl = pre.previousElementSibling;
         if (prevEl && prevEl.classList.contains('code-label')) {
           prevEl.remove();
         }
 
-        // Create runner container
         const runner = document.createElement('div');
         runner.className = 'runner-block reveal visible' + (startExpanded ? ' expanded' : ' collapsed');
 
-        // Header (clickable to toggle)
         const header = document.createElement('div');
         header.className = 'runner-header';
         header.innerHTML = `
@@ -239,62 +241,31 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
           </div>
         `;
 
-        // Collapsible body
         const body = document.createElement('div');
         body.className = 'runner-body';
 
-        // Editor with syntax highlighting overlay
-        const editor = document.createElement('div');
-        editor.className = 'runner-editor';
+        const editorContainer = document.createElement('div');
+        editorContainer.className = 'runner-editor';
 
-        const highlight = document.createElement('pre');
-        highlight.className = 'runner-highlight';
-        highlight.setAttribute('aria-hidden', 'true');
-
-        const textarea = document.createElement('textarea');
-        textarea.value = rawCode.trim();
-        textarea.spellcheck = false;
-        textarea.setAttribute('autocapitalize', 'off');
-        textarea.setAttribute('autocomplete', 'off');
-        textarea.setAttribute('autocorrect', 'off');
-
-        function syncHighlight() {
-          highlight.innerHTML = highlightPython(textarea.value) + '\n';
-          textarea.style.height = 'auto';
-          textarea.style.height = textarea.scrollHeight + 'px';
-          highlight.style.height = textarea.style.height;
-        }
-
-        textarea.addEventListener('input', syncHighlight);
-        textarea.addEventListener('scroll', () => {
-          highlight.scrollTop = textarea.scrollTop;
-          highlight.scrollLeft = textarea.scrollLeft;
-        });
-
-        editor.appendChild(highlight);
-        editor.appendChild(textarea);
-
-        // Toolbar
         const toolbar = document.createElement('div');
         toolbar.className = 'runner-toolbar';
 
-        const runBtn = document.createElement('button');
+        const runBtn = document.createElement('button') as HTMLButtonElement;
         runBtn.className = 'runner-btn runner-btn-run';
         runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Run';
         runBtn.disabled = true;
 
-        const resetBtn = document.createElement('button');
+        const resetBtn = document.createElement('button') as HTMLButtonElement;
         resetBtn.className = 'runner-btn runner-btn-reset';
         resetBtn.textContent = 'Reset';
 
         toolbar.appendChild(runBtn);
         toolbar.appendChild(resetBtn);
 
-        // Output
-        const output = document.createElement('div');
+        const output = document.createElement('div') as HTMLDivElement;
         output.className = 'runner-output';
 
-        body.appendChild(editor);
+        body.appendChild(editorContainer);
         body.appendChild(toolbar);
         body.appendChild(output);
 
@@ -303,42 +274,52 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
 
         pre.replaceWith(runner);
 
-        // Toggle expand/collapse
         const toggleHint = header.querySelector('.runner-toggle-hint');
         function toggleRunner() {
           const isCollapsed = runner.classList.contains('collapsed');
           runner.classList.toggle('collapsed', !isCollapsed);
           runner.classList.toggle('expanded', isCollapsed);
-          toggleHint.textContent = isCollapsed ? 'collapse' : 'click to open';
-          if (isCollapsed) {
-            requestAnimationFrame(() => syncHighlight());
+          if (toggleHint) toggleHint.textContent = isCollapsed ? 'collapse' : 'click to open';
+          if (isCollapsed && runners[idx]?.editor) {
+            requestAnimationFrame(() => runners[idx].editor.view.requestMeasure());
           }
         }
-        header.addEventListener('click', (e) => {
-          if (e.target.closest('.runner-badge')) return;
+        header.addEventListener('click', (e: Event) => {
+          if ((e.target as HTMLElement)?.closest?.('.runner-badge')) return;
           toggleRunner();
         });
         header.style.cursor = 'pointer';
 
-        // Initial highlight + auto-size
-        requestAnimationFrame(() => {
-          syncHighlight();
+        runners.push({
+          editor: null as any,
+          runBtn,
+          resetBtn,
+          output,
+          rawCode,
+          badge: header.querySelector(`[data-badge="${idx}"]`),
         });
 
-        // Store references
-        runners.push({ textarea, runBtn, resetBtn, output, rawCode: rawCode.trim(), badge: header.querySelector(`[data-badge="${idx}"]`) });
+        const runnerIdx = idx;
 
-        // Reset handler
+        import('../scripts/editor').then(({ createEditor }) => {
+          const cmEditor = createEditor(editorContainer, rawCode, () => {
+            runBtn.click();
+          });
+          runners[runnerIdx].editor = cmEditor;
+        });
+
         resetBtn.addEventListener('click', () => {
-          textarea.value = rawCode.trim();
-          syncHighlight();
+          const ed = runners[runnerIdx]?.editor;
+          if (ed) ed.setValue(rawCode);
           output.classList.remove('visible', 'has-error');
           output.textContent = '';
         });
 
-        // Run handler
         runBtn.addEventListener('click', async () => {
           if (!pyodideReady) return;
+          const ed = runners[runnerIdx]?.editor;
+          if (!ed) return;
+
           runBtn.disabled = true;
           runBtn.classList.add('running');
           runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Running...';
@@ -347,7 +328,6 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
           output.innerHTML = '<span class="output-label">Output</span>';
 
           try {
-            // Redirect stdout/stderr
             pyodideInstance.runPython(`
 import sys, io
 _stdout_capture = io.StringIO()
@@ -356,22 +336,23 @@ sys.stdout = _stdout_capture
 sys.stderr = _stderr_capture
 `);
 
-            // Run user code
             let result;
             try {
-              result = await pyodideInstance.runPythonAsync(textarea.value);
-            } catch (pyErr) {
+              result = await pyodideInstance.runPythonAsync(ed.getValue());
+            } catch (pyErr: any) {
+              let captured = '';
+              try {
+                captured = pyodideInstance.runPython(`_stderr_capture.getvalue()`) || '';
+              } catch {}
               pyodideInstance.runPython(`sys.stdout = sys.__stdout__; sys.stderr = sys.__stderr__`);
+              const errMsg = captured.trim() || extractError(pyErr);
               output.classList.add('has-error');
-              output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(pyErr.message);
+              output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(errMsg);
               return;
             }
 
-            // Capture output
             const stdout = pyodideInstance.runPython(`_stdout_capture.getvalue()`);
             const stderr = pyodideInstance.runPython(`_stderr_capture.getvalue()`);
-
-            // Restore
             pyodideInstance.runPython(`sys.stdout = sys.__stdout__; sys.stderr = sys.__stderr__`);
 
             let text = '';
@@ -382,118 +363,49 @@ sys.stderr = _stderr_capture
             }
             if (!text.trim()) text = '(no output)';
             output.innerHTML = '<span class="output-label">Output</span>' + escapeHtml(text);
-          } catch (e) {
+          } catch (e: any) {
             output.classList.add('has-error');
-            output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(String(e));
+            output.innerHTML = '<span class="output-label">Error</span>' + escapeHtml(extractError(e));
           } finally {
             runBtn.disabled = false;
             runBtn.classList.remove('running');
             runBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 1.5L10 6L2.5 10.5V1.5Z" fill="currentColor"/></svg> Run';
           }
         });
-
-        // Ctrl+Enter to run
-        textarea.addEventListener('keydown', (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-            e.preventDefault();
-            runBtn.click();
-          }
-          // Tab support
-          if (e.key === 'Tab') {
-            e.preventDefault();
-            const start = textarea.selectionStart;
-            const end = textarea.selectionEnd;
-            textarea.value = textarea.value.substring(0, start) + '    ' + textarea.value.substring(end);
-            textarea.selectionStart = textarea.selectionEnd = start + 4;
-          }
-        });
       });
 
-      function escapeHtml(str) {
+      function extractError(err: any): string {
+        if (!err) return 'Unknown error';
+        if (typeof err.message === 'string' && err.message.length > 20) return err.message;
+        if (typeof err.args?.toJs === 'function') {
+          try { const a = err.args.toJs(); if (a?.[0]) return String(a[0]); } catch {}
+        }
+        const str = String(err);
+        if (str && str !== 'PythonError' && str !== '[object Object]') return str;
+        if (typeof err.message === 'string') return err.message;
+        try {
+          const keys = Object.getOwnPropertyNames(err);
+          for (const k of keys) {
+            const v = err[k];
+            if (typeof v === 'string' && v.length > 10) return v;
+          }
+        } catch {}
+        return 'Unknown error';
+      }
+
+      function escapeHtml(str: string) {
         const d = document.createElement('div');
         d.textContent = str;
         return d.innerHTML;
       }
 
-      // Python syntax highlighter
-      function highlightPython(code) {
-        const keywords = new Set([
-          'False','None','True','and','as','assert','async','await',
-          'break','class','continue','def','del','elif','else','except',
-          'finally','for','from','global','if','import','in','is',
-          'lambda','nonlocal','not','or','pass','raise','return',
-          'try','while','with','yield'
-        ]);
-        const builtins = new Set([
-          'print','len','range','int','float','str','bool','list',
-          'dict','set','tuple','type','isinstance','enumerate','zip',
-          'map','filter','sorted','reversed','abs','max','min','sum',
-          'open','super','property','staticmethod','classmethod',
-          'hasattr','getattr','setattr','iter','next','repr','hash'
-        ]);
-
-        // Tokenize with a single regex
-        const tokenRe = /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|"""[\s\S]*?"""|'''[\s\S]*?'''|#[^\n]*|\b\d+(?:\.\d+)?\b|[a-zA-Z_]\w*|[+\-*\/%=<>!&|^~@]+|[()[\]{},.:;]|\S)/g;
-
-        let result = '';
-        let lastIndex = 0;
-
-        for (const match of code.matchAll(tokenRe)) {
-          // Add any whitespace/gaps between tokens
-          if (match.index > lastIndex) {
-            result += escapeHtml(code.slice(lastIndex, match.index));
-          }
-          lastIndex = match.index + match[0].length;
-
-          const tok = match[0];
-          const esc = escapeHtml(tok);
-
-          if (tok.startsWith('#')) {
-            result += `<span class="hl-comment">${esc}</span>`;
-          } else if (tok.startsWith('"') || tok.startsWith("'")) {
-            result += `<span class="hl-string">${esc}</span>`;
-          } else if (/^\d/.test(tok)) {
-            result += `<span class="hl-number">${esc}</span>`;
-          } else if (keywords.has(tok)) {
-            result += `<span class="hl-keyword">${esc}</span>`;
-          } else if (builtins.has(tok)) {
-            result += `<span class="hl-builtin">${esc}</span>`;
-          } else if (/^[a-zA-Z_]\w*$/.test(tok)) {
-            // Check if followed by ( to detect function calls
-            const after = code.slice(lastIndex).match(/^\s*\(/);
-            if (after) {
-              result += `<span class="hl-func">${esc}</span>`;
-            } else {
-              result += esc;
-            }
-          } else if (/^[+\-*\/%=<>!&|^~@]+$/.test(tok)) {
-            result += `<span class="hl-operator">${esc}</span>`;
-          } else if (tok === '(' || tok === ')' || tok === '[' || tok === ']' || tok === '{' || tok === '}') {
-            result += `<span class="hl-paren">${esc}</span>`;
-          } else if (tok === '.' || tok === ',' || tok === ':' || tok === ';') {
-            result += `<span class="hl-punct">${esc}</span>`;
-          } else {
-            result += esc;
-          }
-        }
-
-        // Any trailing text
-        if (lastIndex < code.length) {
-          result += escapeHtml(code.slice(lastIndex));
-        }
-
-        return result;
-      }
-
-      // Load Pyodide
       async function initPyodide() {
         if (pyodideLoading) return;
         pyodideLoading = true;
 
         try {
-          // Load Pyodide script
           const script = document.createElement('script');
-          script.src = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.js';
+          script.src = 'https://cdn.jsdelivr.net/pyodide/v0.29.3/full/pyodide.js';
           document.head.appendChild(script);
 
           await new Promise((resolve, reject) => {
@@ -501,32 +413,40 @@ sys.stderr = _stderr_capture
             script.onerror = reject;
           });
 
-          // Initialize
-          pyodideInstance = await loadPyodide();
+          pyodideInstance = await (window as any).loadPyodide();
           await pyodideInstance.loadPackage('micropip');
           const micropip = pyodideInstance.pyimport('micropip');
           await micropip.install('pyfloe');
 
           pyodideReady = true;
 
-          // Update all badges and enable buttons
+          import('../scripts/python-linter').then(({ setPyodide }) => {
+            setPyodide(pyodideInstance);
+          });
+          import('../scripts/pyfloe-completions').then(({ setCompletionPyodide }) => {
+            setCompletionPyodide(pyodideInstance);
+          });
+
           runners.forEach(r => {
-            r.badge.textContent = 'Ready';
-            r.badge.classList.remove('loading');
+            if (r.badge) {
+              r.badge.textContent = 'Ready';
+              r.badge.classList.remove('loading');
+            }
             r.runBtn.disabled = false;
           });
         } catch (e) {
           console.error('Pyodide init failed:', e);
           runners.forEach(r => {
-            r.badge.textContent = 'Failed to load';
-            r.badge.classList.remove('loading');
-            r.badge.style.color = '#F38BA8';
-            r.badge.style.background = 'rgba(243, 139, 168, 0.1)';
+            if (r.badge) {
+              r.badge.textContent = 'Failed to load';
+              r.badge.classList.remove('loading');
+              r.badge.style.color = '#F38BA8';
+              r.badge.style.background = 'rgba(243, 139, 168, 0.1)';
+            }
           });
         }
       }
 
-      // Start loading Pyodide when first runner scrolls into view
       const loadObserver = new IntersectionObserver((entries) => {
         if (entries.some(e => e.isIntersecting)) {
           loadObserver.disconnect();
@@ -541,9 +461,21 @@ sys.stderr = _stderr_capture
     // SITE SEARCH
     // ============================================================
     (function() {
-      const searchInput = document.getElementById('site-search');
+      const searchInput = document.getElementById('site-search') as HTMLInputElement | null;
       const searchResults = document.getElementById('search-results');
-      let index = null;
+
+      interface SearchSection {
+        heading: string;
+        text: string;
+      }
+
+      interface SearchPage {
+        slug: string;
+        title: string;
+        sections: SearchSection[];
+      }
+
+      let index: SearchPage[] | null = null;
       let indexLoading = false;
 
       async function loadIndex() {
@@ -557,7 +489,7 @@ sys.stderr = _stderr_capture
         }
       }
 
-      function highlight(text, terms) {
+      function highlight(text: string, terms: string[]) {
         let result = text;
         for (const term of terms) {
           const re = new RegExp('(' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
@@ -566,29 +498,29 @@ sys.stderr = _stderr_capture
         return result;
       }
 
-      function search(query) {
+      function search(query: string) {
+        if (!searchResults) return;
         if (!index || !query.trim()) {
           searchResults.innerHTML = '';
           searchResults.classList.remove('open');
           return;
         }
 
-        const terms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+        const terms = query.toLowerCase().split(/\s+/).filter((t: string) => t.length >= 2);
         if (terms.length === 0) {
           searchResults.innerHTML = '';
           searchResults.classList.remove('open');
           return;
         }
 
-        const results = [];
+        const results: Array<{ slug: string; pageTitle: string; heading: string; snippet: string }> = [];
 
         for (const page of index) {
           for (const section of page.sections) {
             const textLower = section.text.toLowerCase();
             const headingLower = section.heading.toLowerCase();
-            const matches = terms.every(t => textLower.includes(t) || headingLower.includes(t));
+            const matches = terms.every((t: string) => textLower.includes(t) || headingLower.includes(t));
             if (matches) {
-              // Find a snippet around the first match
               const firstTerm = terms[0];
               const pos = textLower.indexOf(firstTerm);
               const start = Math.max(0, pos - 40);
@@ -613,7 +545,6 @@ sys.stderr = _stderr_capture
           return;
         }
 
-        // Group by page, max 8 results
         const shown = results.slice(0, 8);
         let html = '';
         let lastSlug = '';
@@ -634,26 +565,26 @@ sys.stderr = _stderr_capture
         searchResults.classList.add('open');
       }
 
-      let debounceTimer;
+      let debounceTimer: ReturnType<typeof setTimeout> | undefined;
       searchInput?.addEventListener('focus', loadIndex);
-      searchInput?.addEventListener('input', function() {
+      searchInput?.addEventListener('input', function(this: HTMLInputElement) {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => search(this.value), 150);
       });
 
-      // Close on click outside
-      document.addEventListener('click', function(e) {
-        if (!e.target.closest('.sidebar-search')) {
+      document.addEventListener('click', function(e: MouseEvent) {
+        if (!(e.target as HTMLElement)?.closest('.sidebar-search')) {
           searchResults?.classList.remove('open');
         }
       });
 
-      // Close on Escape
-      searchInput?.addEventListener('keydown', function(e) {
+      searchInput?.addEventListener('keydown', function(this: HTMLInputElement, e: KeyboardEvent) {
         if (e.key === 'Escape') {
           this.value = '';
-          searchResults.innerHTML = '';
-          searchResults.classList.remove('open');
+          if (searchResults) {
+            searchResults.innerHTML = '';
+            searchResults.classList.remove('open');
+          }
           this.blur();
         }
       });
