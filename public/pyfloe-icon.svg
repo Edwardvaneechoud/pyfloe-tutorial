@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0C4A6E"/>
+      <stop offset="100%" stop-color="#082F49"/>
+    </linearGradient>
+    <linearGradient id="s1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E0F2FE"/>
+      <stop offset="100%" stop-color="#7DD3FC"/>
+    </linearGradient>
+    <linearGradient id="s2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="100%" stop-color="#0EA5E9"/>
+    </linearGradient>
+    <linearGradient id="s3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#0369A1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bg)"/>
+
+  <!-- 
+    Three flowing streams, staggered vertically.
+    Each is a thick filled ribbon with organic S-curves.
+    They suggest water flowing lazily from left to right.
+  -->
+
+  <!-- Stream 1 — top, lightest -->
+  <path d="
+    M 80 155
+    C 140 120, 200 190, 256 170
+    C 312 150, 350 100, 432 135
+    L 432 165
+    C 350 135, 312 185, 256 200
+    C 200 220, 140 148, 80 185
+    Z
+  " fill="url(#s1)" opacity="0.95"/>
+
+  <!-- Stream 2 — middle -->
+  <path d="
+    M 80 240
+    C 150 210, 195 290, 256 265
+    C 317 240, 370 195, 432 230
+    L 432 262
+    C 370 230, 317 275, 256 297
+    C 195 322, 150 240, 80 272
+    Z
+  " fill="url(#s2)" opacity="0.9"/>
+
+  <!-- Stream 3 — bottom, deepest -->
+  <path d="
+    M 80 330
+    C 155 300, 200 380, 256 358
+    C 312 336, 365 290, 432 325
+    L 432 360
+    C 365 328, 312 374, 256 393
+    C 200 415, 155 332, 80 365
+    Z
+  " fill="url(#s3)" opacity="0.85"/>
+
+  <!-- Subtle droplet accent — top-left -->
+  <circle cx="118" cy="110" r="12" fill="#BAE6FD" opacity="0.6"/>
+  <circle cx="145" cy="95" r="7" fill="#E0F2FE" opacity="0.4"/>
+</svg>
