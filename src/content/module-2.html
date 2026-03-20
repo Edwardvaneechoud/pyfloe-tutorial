@@ -1301,10 +1301,13 @@ It should support <code>-col("price")</code> by implementing the
 </ul>
 
 <div class="code-label"><span class="dot dot-python"></span> Starter code — implement NegExpr</div>
-<pre data-executable data-expanded data-label="Hands-on: build a NegExpr"><code>class Expr:
-    def required_columns(self):
+<pre data-executable data-expanded data-label="Hands-on: build a NegExpr"><code>from __future__ import annotations
+from collections.abc import Callable
+
+class Expr:
+    def required_columns(self) -> set[str]:
         return set()
-    def eval(self, row):
+    def eval(self, row: dict):
         raise NotImplementedError
     def __neg__(self):
         # TODO: return a NegExpr wrapping self
@@ -1313,34 +1316,34 @@ It should support <code>-col("price")</code> by implementing the
         return BinaryExpr(self, other if isinstance(other, Expr) else Lit(other), lambda a, b: a > b, ">")
 
 class Col(Expr):
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
-    def required_columns(self):
+    def required_columns(self) -> set[str]:
         return {self.name}
-    def eval(self, row):
+    def eval(self, row: dict):
         return row[self.name]
 
 class Lit(Expr):
-    def __init__(self, value):
+    def __init__(self, value: int | float | str):
         self.value = value
-    def eval(self, row):
+    def eval(self, row: dict):
         return self.value
 
 class BinaryExpr(Expr):
-    def __init__(self, left, right, op, op_str):
+    def __init__(self, left: Expr, right: Expr, op: Callable, op_str: str):
         self.left, self.right, self.op, self.op_str = left, right, op, op_str
-    def required_columns(self):
+    def required_columns(self) -> set[str]:
         return self.left.required_columns() | self.right.required_columns()
-    def eval(self, row):
+    def eval(self, row: dict):
         return self.op(self.left.eval(row), self.right.eval(row))
 
 class NegExpr(Expr):
-    def __init__(self, child):
+    def __init__(self, child: Expr):
         self.child = child
-    def required_columns(self):
+    def required_columns(self) -> set[str]:
         # TODO
         pass
-    def eval(self, row):
+    def eval(self, row: dict):
         # TODO
         pass
 

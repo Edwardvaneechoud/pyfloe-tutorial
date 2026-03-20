@@ -451,19 +451,22 @@ Let's use it:
 <span class="bi">print</span>(<span class="va">result</span>)
 <span class="cm"># [{'name': 'Alice', 'age': 30, 'region': 'EU'}]</span></code></pre>
 
-<pre data-executable data-label="Volcano model — by hand, then pyfloe"><code># Part 1: Build it yourself — just generators and classes
+<pre data-executable data-label="Volcano model — by hand, then pyfloe"><code>from __future__ import annotations
+from collections.abc import Callable, Iterator
+
+# Part 1: Build it yourself — just generators and classes
 class ScanNode:
-    def __init__(self, data):
+    def __init__(self, data: list[dict]):
         self.data = data
-    def execute(self):
+    def execute(self) -> Iterator[dict]:
         for row in self.data:
             yield row           # one row at a time!
 
 class FilterNode:
-    def __init__(self, child, condition):
+    def __init__(self, child: ScanNode | FilterNode, condition: Callable[[dict], bool]):
         self.child = child
         self.condition = condition
-    def execute(self):
+    def execute(self) -> Iterator[dict]:
         for row in self.child.execute():  # pull from child
             if self.condition(row):
                 yield row                 # pass it up
@@ -770,21 +773,24 @@ generator-based equivalent of Python's built-in <code>map()</code>.
 </ul>
 
 <div class="code-label"><span class="dot dot-python"></span> Starter code — fill in MapNode.execute()</div>
-<pre data-executable data-expanded data-label="Hands-on: build a MapNode"><code>class PlanNode:
-    def execute(self):
+<pre data-executable data-expanded data-label="Hands-on: build a MapNode"><code>from __future__ import annotations
+from collections.abc import Callable, Iterator
+
+class PlanNode:
+    def execute(self) -> Iterator[dict]:
         raise NotImplementedError
 
 class ScanNode(PlanNode):
-    def __init__(self, rows):
+    def __init__(self, rows: list[dict]):
         self.rows = rows
-    def execute(self):
+    def execute(self) -> Iterator[dict]:
         yield from self.rows
 
 class MapNode(PlanNode):
-    def __init__(self, child, func):
+    def __init__(self, child: PlanNode, func: Callable[[dict], dict]):
         self.child = child
         self.func = func
-    def execute(self):
+    def execute(self) -> Iterator[dict]:
         # TODO: yield each row transformed by self.func
         pass
 
