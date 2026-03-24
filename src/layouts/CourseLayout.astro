@@ -43,6 +43,8 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
   <meta name="twitter:card" content="summary">
   <meta name="twitter:image" content={`${base}pyfloe-icon.svg`}>
   <link rel="stylesheet" href={`${base}global.css`}>
+  <script data-goatcounter="https://pyfloe.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
 </head>
 <body>
   <div class="reading-progress" id="reading-progress"></div>
@@ -113,7 +115,13 @@ const nextPage = currentIndex < allPages.length - 1 ? allPages[currentIndex + 1]
             <a href={`${base}${nextPage.slug}/`} class="page-nav-next">{nextPage.short || nextPage.title} &rarr;</a>
           ) : <span />}
         </div>
-        <footer class="site-footer">Created by Edward van Eechoud</footer>
+        <footer class="site-footer">
+          Created by <a href="https://www.linkedin.com/in/edwardvaneechoud/" target="_blank" rel="noopener">Edward van Eechoud</a>
+          <span class="footer-sep"> · </span>
+          <a href="https://github.com/Edwardvaneechoud/pyfloe-tutorial/discussions" target="_blank" rel="noopener">Discussions</a>
+          <span class="footer-sep"> · </span>
+          <a href="https://buymeacoffee.com/evaneechoud" target="_blank" rel="noopener">☕ Buy Me a Coffee</a>
+        </footer>
       </div>
     </main>
   </div>
